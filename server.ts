@@ -105,13 +105,31 @@ export interface ProjectLinkRow {
   jiraProjectKeys: string[];
 }
 
+/** A machine (bb daemon) holding a checkout of one BB project. */
+export interface AgentHost {
+  hostId: string;
+  name: string;
+  /** The daemon is online now. A disconnected one cannot start the thread. */
+  connected: boolean;
+  /** The project's default checkout, which the thread uses when none is picked. */
+  isDefault: boolean;
+}
+
+/** One BB project the thread can start in, with the machines that have it. */
+export interface AgentProject {
+  bbProjectId: string;
+  name: string;
+  /** Machines with a checkout of this project; a picker only for two or more. */
+  hosts: AgentHost[];
+}
+
 /** Where "Send to agent" can start a thread for one issue. */
 export interface AgentTargets {
   jiraProjectKey: string;
   /** BB projects linked to the issue's Jira project, by name. */
-  linked: Array<{ bbProjectId: string; name: string }>;
+  linked: AgentProject[];
   /** Every BB project, by name, for when none (or another) is wanted. */
-  all: Array<{ bbProjectId: string; name: string }>;
+  all: AgentProject[];
 }
 
 export interface ThreadLink {
@@ -253,6 +271,10 @@ export const jiraRpcContract = defineRpcContract({
         note: z.string().max(4000).default(""),
         /** Also link the issue's Jira project to that BB project. */
         linkProject: z.boolean().default(false),
+        /** Work in a fresh worktree instead of the project's checkout. */
+        worktree: z.boolean().default(false),
+        /** The machine to run on; empty means the project's default checkout. */
+        hostId: z.string().default(""),
       })
       .strict(),
     output: z.object({ threadId: z.string() }),
@@ -262,6 +284,31 @@ export const jiraRpcContract = defineRpcContract({
 // ---------------------------------------------------------------------------
 // Pure helpers — exported for tests.
 // ---------------------------------------------------------------------------
+
+type ThreadEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+
+/**
+ * Where the thread runs. Two independent choices: which machine holds the
+ * checkout, and whether to work in it or in a fresh worktree branched from its
+ * default base. Neither choice picked leaves the project's own default
+ * environment to bb, exactly as before.
+ */
+export function threadEnvironment(
+  project: AgentProject,
+  hostId: string,
+  worktree: boolean,
+): ThreadEnvironment {
+  const workspace = worktree
+    ? ({ type: "managed-worktree", baseBranch: { kind: "default" } } as const)
+    : ({ type: "unmanaged", path: null } as const);
+  if (hostId.length === 0) {
+    return worktree ? { type: "host", workspace } : { type: "project-default" };
+  }
+  if (!project.hosts.some((host) => host.hostId === hostId)) {
+    throw new Error(`${project.name} is not checked out on that machine.`);
+  }
+  return { type: "host", hostId, workspace };
+}
 
 export function formatIssueRow(issue: JiraIssueSummary): string {
   return [
@@ -565,10 +612,52 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function listBbProjects(): Promise<Array<{ bbProjectId: string; name: string }>> {
-    const projects = (await bb.sdk.projects.list()) as unknown as Array<{ id: string; name: string }>;
+  /**
+   * The machines a thread can run on. One bb install can have several daemons
+   * enrolled, and a project is only checked out on some of them, so the
+   * machines on offer are the project's own sources — named, and marked with
+   * whether the daemon is online right now.
+   */
+  async function listHosts(): Promise<Map<string, { name: string; connected: boolean }>> {
+    const hosts = new Map<string, { name: string; connected: boolean }>();
+    try {
+      for (const host of await bb.sdk.hosts.list()) {
+        hosts.set(host.id, { name: host.name, connected: host.status === "connected" });
+      }
+    } catch (error) {
+      // Without the machine list the send still works on the default checkout.
+      bb.log.warn(`could not list machines: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return hosts;
+  }
+
+  async function listBbProjects(): Promise<AgentProject[]> {
+    const projects = (await bb.sdk.projects.list()) as unknown as Array<{
+      id: string;
+      name: string;
+      sources?: Array<{ hostId: string; isDefault: boolean }>;
+    }>;
+    const hosts = await listHosts();
     return projects
-      .map((project) => ({ bbProjectId: project.id, name: project.name }))
+      .map((project) => ({
+        bbProjectId: project.id,
+        name: project.name,
+        hosts: (project.sources ?? [])
+          .filter((source) => hosts.has(source.hostId))
+          .map((source) => ({
+            hostId: source.hostId,
+            name: hosts.get(source.hostId)?.name ?? source.hostId,
+            connected: hosts.get(source.hostId)?.connected ?? false,
+            isDefault: source.isDefault,
+          }))
+          // The default checkout first, then online machines, then by name.
+          .sort(
+            (left, right) =>
+              Number(right.isDefault) - Number(left.isDefault) ||
+              Number(right.connected) - Number(left.connected) ||
+              left.name.localeCompare(right.name),
+          ),
+      }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
@@ -587,13 +676,17 @@ export default async function plugin(bb: BbPluginApi) {
     bbProjectId: string;
     note: string;
     linkProject: boolean;
+    worktree: boolean;
+    hostId: string;
   }): Promise<string> {
     const { key, note } = args;
     const projectId = args.bbProjectId;
     // The panel only offers real projects, but the id still crosses the wire.
-    if (!(await listBbProjects()).some((project) => project.bbProjectId === projectId)) {
+    const target = (await listBbProjects()).find((project) => project.bbProjectId === projectId);
+    if (target === undefined) {
       throw new Error("That BB project no longer exists.");
     }
+    const environment = threadEnvironment(target, args.hostId, args.worktree);
     const jira = await client();
     const [issue, comments] = await Promise.all([jira.getIssue(key), jira.listComments(key)]);
     if (args.linkProject && !linkedKeys(projectId).includes(issue.projectKey)) {
@@ -612,7 +705,7 @@ export default async function plugin(bb: BbPluginApi) {
       .join("\n");
     const thread = (await bb.sdk.threads.spawn({
       projectId,
-      environment: { type: "project-default" },
+      environment,
       title: `${issue.key}: ${issue.summary}`.slice(0, 120),
       prompt,
     })) as unknown as { id: string };

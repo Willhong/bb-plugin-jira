@@ -2,7 +2,7 @@
 // agent write gate: nothing reaches Jira before approval, a refusal writes
 // nothing, "Always allow" persists, and each action's policy is independent.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makeHostResponse } from "@get-bb/plugin-sdk/testing";
 import plugin, { matchTransition, matchUser } from "../server";
 import { PERMISSION_ALWAYS } from "../jira";
 
@@ -344,16 +344,26 @@ describe("project links", () => {
 });
 
 describe("send to agent", () => {
+  // Two enrolled daemons: the laptop is online and holds every checkout, the
+  // desktop is offline and only has web-app.
+  const source = (hostId: string, isDefault = false) => ({ hostId, isDefault, path: `/src/${hostId}` });
+
   async function loadWithProjects() {
     const host = createFakePluginHost({
       pluginId: "jira",
       settings: CONFIGURED,
       sdk: {
+        hosts: {
+          list: async () => [
+            makeHostResponse({ id: "host-laptop", name: "laptop", status: "connected" }),
+            makeHostResponse({ id: "host-desktop", name: "desktop", status: "disconnected" }),
+          ],
+        },
         projects: {
           list: async () => [
-            { id: "proj-web", name: "web-app" },
-            { id: "proj-api", name: "api" },
-            { id: "proj-misc", name: "misc" },
+            { id: "proj-web", name: "web-app", sources: [source("host-desktop"), source("host-laptop", true)] },
+            { id: "proj-api", name: "api", sources: [source("host-laptop", true)] },
+            { id: "proj-misc", name: "misc", sources: [] },
           ],
         },
         threads: { spawn: async () => ({ id: "thr-new" }) },
@@ -373,16 +383,18 @@ describe("send to agent", () => {
     await harness.callRpc("setProjectLink", { bbProjectId: "proj-api", jiraProjectKeys: ["WEB"] });
     await harness.callRpc("setProjectLink", { bbProjectId: "proj-web", jiraProjectKeys: ["APP", "WEB"] });
     await harness.callRpc("setProjectLink", { bbProjectId: "proj-misc", jiraProjectKeys: ["OPS"] });
+    const laptop = { hostId: "host-laptop", name: "laptop", connected: true, isDefault: true };
+    const desktop = { hostId: "host-desktop", name: "desktop", connected: false, isDefault: false };
     expect(await harness.callRpc("agentTargets", { key: "WEB-1" })).toEqual({
       jiraProjectKey: "WEB",
       linked: [
-        { bbProjectId: "proj-api", name: "api" },
-        { bbProjectId: "proj-web", name: "web-app" },
+        { bbProjectId: "proj-api", name: "api", hosts: [laptop] },
+        { bbProjectId: "proj-web", name: "web-app", hosts: [laptop, desktop] },
       ],
       all: [
-        { bbProjectId: "proj-api", name: "api" },
-        { bbProjectId: "proj-misc", name: "misc" },
-        { bbProjectId: "proj-web", name: "web-app" },
+        { bbProjectId: "proj-api", name: "api", hosts: [laptop] },
+        { bbProjectId: "proj-misc", name: "misc", hosts: [] },
+        { bbProjectId: "proj-web", name: "web-app", hosts: [laptop, desktop] },
       ],
     });
   });
@@ -404,6 +416,53 @@ describe("send to agent", () => {
     await harness.callRpc("setProjectLink", { bbProjectId: "proj-api", jiraProjectKeys: ["OPS"] });
     await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-api", linkProject: true });
     expect(await harness.callRpc("projectLink", { bbProjectId: "proj-api" })).toEqual({ jiraProjectKeys: ["OPS", "WEB"] });
+  });
+
+  it("works in the project's own checkout by default", async () => {
+    const harness = await loadWithProjects();
+    await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web" });
+    const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [{ environment: unknown }];
+    expect(spawn.environment).toEqual({ type: "project-default" });
+  });
+
+  it("starts a new worktree when asked", async () => {
+    const harness = await loadWithProjects();
+    await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web", worktree: true });
+    const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [{ environment: unknown }];
+    expect(spawn.environment).toEqual({
+      type: "host",
+      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+    });
+  });
+
+  it("runs on the chosen machine, in its checkout or in a worktree", async () => {
+    const harness = await loadWithProjects();
+    await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web", hostId: "host-desktop" });
+    await harness.callRpc("sendToAgent", {
+      key: "WEB-1",
+      bbProjectId: "proj-web",
+      hostId: "host-desktop",
+      worktree: true,
+    });
+    const environments = harness.sdk
+      .callsTo("threads.spawn")
+      .map(([spawn]) => (spawn as { environment: unknown }).environment);
+    expect(environments).toEqual([
+      { type: "host", hostId: "host-desktop", workspace: { type: "unmanaged", path: null } },
+      {
+        type: "host",
+        hostId: "host-desktop",
+        workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      },
+    ]);
+  });
+
+  it("refuses a machine the project is not checked out on", async () => {
+    const harness = await loadWithProjects();
+    await expect(
+      harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-api", hostId: "host-desktop" }),
+    ).rejects.toThrow("not checked out on that machine");
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([]);
   });
 
   it("refuses an unknown BB project without spawning", async () => {

@@ -848,6 +848,8 @@ function SendToAgentDialog({
   const [targets, setTargets] = useState<AgentTargets | null>(null);
   const [bbProjectId, setBbProjectId] = useState("");
   const [linkProject, setLinkProject] = useState(true);
+  const [worktree, setWorktree] = useState(false);
+  const [hostId, setHostId] = useState("");
 
   useEffect(() => {
     if (!open) return;
@@ -869,6 +871,14 @@ function SendToAgentDialog({
   const linkedIds = new Set(targets?.linked.map((project) => project.bbProjectId) ?? []);
   const chosenIsLinked = linkedIds.has(bbProjectId);
   const others = targets?.all.filter((project) => !linkedIds.has(project.bbProjectId)) ?? [];
+  // Each project is checked out on its own machines, so a machine picked for
+  // one project means nothing for the next.
+  const hosts = targets?.all.find((project) => project.bbProjectId === bbProjectId)?.hosts ?? [];
+  const chosenHostOffline = hosts.some((host) => host.hostId === hostId && !host.connected);
+  const chooseProject = (next: string) => {
+    setBbProjectId(next);
+    setHostId("");
+  };
 
   const send = () => {
     if (bbProjectId.length === 0 || busy) return;
@@ -879,6 +889,8 @@ function SendToAgentDialog({
         bbProjectId,
         note,
         linkProject: !chosenIsLinked && linkProject,
+        worktree,
+        hostId: hosts.some((host) => host.hostId === hostId) ? hostId : "",
       })
       .then(({ threadId }) => {
         onOpenChange(false);
@@ -910,13 +922,13 @@ function SendToAgentDialog({
               <button
                 type="button"
                 className="shrink-0 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                onClick={() => setBbProjectId("")}
+                onClick={() => chooseProject("")}
               >
                 Change
               </button>
             </div>
           ) : (
-            <Select value={bbProjectId || undefined} onValueChange={setBbProjectId}>
+            <Select value={bbProjectId || undefined} onValueChange={chooseProject}>
               <SelectTrigger aria-label="BB project">
                 <SelectValue
                   placeholder={
@@ -963,6 +975,47 @@ function SendToAgentDialog({
           ) : null}
         </div>
 
+        {hosts.length > 1 ? (
+          <div className="grid gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground">Machine</span>
+            <Select value={hostId || "default"} onValueChange={(next) => setHostId(next === "default" ? "" : next)}>
+              <SelectTrigger aria-label="Machine">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">
+                  {`Default (${hosts.find((host) => host.isDefault)?.name ?? hosts[0]?.name})`}
+                </SelectItem>
+                {hosts.map((host) => (
+                  <SelectItem key={host.hostId} value={host.hostId}>
+                    {host.connected ? host.name : `${host.name} — offline`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {chosenHostOffline ? (
+              <p className="text-xs text-muted-foreground">
+                That machine is offline right now, so the chat cannot start on it.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        <label className="flex items-start gap-2 text-sm">
+          <Checkbox
+            className="mt-0.5"
+            checked={worktree}
+            disabled={busy}
+            onCheckedChange={(checked) => setWorktree(checked === true)}
+          />
+          <span className="grid gap-0.5">
+            Work in a new worktree
+            <span className="text-xs text-muted-foreground">
+              A fresh branch and checkout for {issue.key}, instead of the project checkout.
+            </span>
+          </span>
+        </label>
+
         <Textarea
           aria-label="Instructions"
           placeholder="What should the agent do? (optional)"
@@ -976,7 +1029,7 @@ function SendToAgentDialog({
           <Button variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy || bbProjectId.length === 0} onClick={send}>
+          <Button disabled={busy || bbProjectId.length === 0 || chosenHostOffline} onClick={send}>
             {busy ? "Starting…" : "Start chat"}
           </Button>
         </DialogFooter>
