@@ -111,7 +111,11 @@ export function CreateIssueDialog({
                 <SelectContent>
                   {projects.map((project) => (
                     <SelectItem key={project.key} value={project.key}>
-                      {project.name} <span className="text-muted-foreground">({project.key})</span>
+                      {/* A long name gives way before the key, which tells projects apart. */}
+                      <span className="flex min-w-0 gap-1">
+                        <span className="truncate">{project.name}</span>
+                        <span className="shrink-0 text-muted-foreground">({project.key})</span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -131,9 +135,9 @@ export function CreateIssueDialog({
                     .filter((type) => !type.subtask)
                     .map((type) => (
                       <SelectItem key={type.id} value={type.id}>
-                        <span className="flex items-center gap-2">
+                        <span className="flex min-w-0 items-center gap-2">
                           <TypeGlyph type={type.name} />
-                          {type.name}
+                          <span className="truncate">{type.name}</span>
                         </span>
                       </SelectItem>
                     ))}
@@ -175,9 +179,9 @@ export function CreateIssueDialog({
                   <SelectItem value={DEFAULT_PRIORITY}>Project default</SelectItem>
                   {options.priorities.map((name) => (
                     <SelectItem key={name} value={name}>
-                      <span className="flex items-center gap-2">
+                      <span className="flex min-w-0 items-center gap-2">
                         <PriorityMark priority={name} />
-                        {name}
+                        <span className="truncate">{name}</span>
                       </span>
                     </SelectItem>
                   ))}
@@ -201,7 +205,9 @@ export function CreateIssueDialog({
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="grid gap-1.5">
+    // min-w-0: a grid cell otherwise grows to its widest unbreakable content,
+    // so a long selected value would push into the neighbouring field.
+    <div className="grid min-w-0 gap-1.5">
       <span className="text-xs font-medium text-muted-foreground">{label}</span>
       {children}
     </div>
