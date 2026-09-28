@@ -90,6 +90,22 @@ const anyOutput = <T>() => z.custom<T>(() => true);
 
 const permissionsSchema = z.record(z.string(), z.enum(["ask", "always"]));
 
+/**
+ * The agent the thread runs on, as bb's provider/model picker resolves it.
+ * Only the shape is checked here; bb itself refuses a provider or model that
+ * does not exist when the thread is spawned.
+ */
+const executionInput = z
+  .object({
+    providerId: z.string().min(1).max(200),
+    model: z.string().min(1).max(200),
+    reasoningLevel: z.enum(["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]),
+    serviceTier: z.enum(["default", "fast"]).optional(),
+  })
+  .strict();
+
+export type AgentExecution = z.infer<typeof executionInput>;
+
 export interface JiraStatus {
   configured: boolean;
   ready: boolean;
@@ -277,6 +293,11 @@ export const jiraRpcContract = defineRpcContract({
     input: z.object({ key: issueKeyInput }).strict(),
     output: anyOutput<AgentTargets>(),
   },
+  /** The agent a new thread in this project gets when none is picked. */
+  executionDefaults: {
+    input: z.object({ bbProjectId: z.string().min(1) }).strict(),
+    output: anyOutput<AgentExecution | null>(),
+  },
   sendToAgent: {
     input: z
       .object({
@@ -290,6 +311,8 @@ export const jiraRpcContract = defineRpcContract({
         worktree: z.boolean().default(false),
         /** The machine to run on; empty means the project's default checkout. */
         hostId: z.string().default(""),
+        /** The agent to run; null leaves it to the project's defaults. */
+        execution: executionInput.nullable().default(null),
       })
       .strict(),
     output: z.object({ threadId: z.string() }),
@@ -693,6 +716,27 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /**
+   * What the model picker starts on: the agent bb would give a new thread in
+   * this project anyway, so leaving the picker alone changes nothing. Null
+   * lets the picker fall back to bb's own default.
+   */
+  async function executionDefaults(projectId: string): Promise<AgentExecution | null> {
+    try {
+      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId });
+      if (defaults === null) return null;
+      return {
+        providerId: defaults.providerId,
+        model: defaults.model,
+        reasoningLevel: defaults.reasoningLevel,
+        serviceTier: defaults.serviceTier,
+      };
+    } catch (error) {
+      bb.log.warn(`could not read ${projectId}'s agent defaults: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
   async function sendToAgent(args: {
     key: string;
     bbProjectId: string;
@@ -700,6 +744,7 @@ export default async function plugin(bb: BbPluginApi) {
     linkProject: boolean;
     worktree: boolean;
     hostId: string;
+    execution: AgentExecution | null;
   }): Promise<string> {
     const { key, note } = args;
     const projectId = args.bbProjectId;
@@ -725,11 +770,28 @@ export default async function plugin(bb: BbPluginApi) {
     ]
       .filter((line) => line !== "")
       .join("\n");
+    const { execution } = args;
     const thread = (await bb.sdk.threads.spawn({
       projectId,
       environment,
       title: `${issue.key}: ${issue.summary}`.slice(0, 120),
       prompt,
+      // Marked explicit so bb keeps the pick instead of re-deriving it from
+      // the project's defaults.
+      ...(execution === null
+        ? {}
+        : {
+            providerId: execution.providerId,
+            model: execution.model,
+            reasoningLevel: execution.reasoningLevel,
+            ...(execution.serviceTier === undefined ? {} : { serviceTier: execution.serviceTier }),
+            executionInputSources: {
+              providerId: "explicit",
+              model: "explicit",
+              reasoningLevel: "explicit",
+              ...(execution.serviceTier === undefined ? {} : { serviceTier: "explicit" }),
+            },
+          }),
     })) as unknown as { id: string };
     const links = (await bb.storage.kv.get<ThreadLink[]>(`threads:${key}`)) ?? [];
     await bb.storage.kv.set(`threads:${key}`, [
@@ -961,6 +1023,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     agentTargets: ({ key }) => agentTargets(key),
+
+    executionDefaults: ({ bbProjectId }) => executionDefaults(bbProjectId),
 
     sendToAgent: async (input) => ({ threadId: await sendToAgent(input) }),
   });

@@ -3,7 +3,13 @@
 // assignee, priority, and labels from the field column. Everything here is
 // the user's own action, so only delete asks for confirmation.
 import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
-import { Markdown, UrlLink, useBbNavigate } from "@get-bb/plugin-sdk/app";
+import {
+  Markdown,
+  UrlLink,
+  experimental_ProviderModelPicker as ProviderModelPicker,
+  useBbNavigate,
+  type ExperimentalProviderModelPickerValue,
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { AgentTargets, JiraComment, JiraIssue, JiraIssueDetail, JiraUser } from "../../server";
 import {
@@ -827,6 +833,13 @@ function DeleteIssueDialog({
   );
 }
 
+/** Unresolved: bb's picker fills in its own default provider and model. */
+const UNPICKED_EXECUTION: ExperimentalProviderModelPickerValue = {
+  providerId: "",
+  model: "",
+  reasoningLevel: "medium",
+};
+
 /**
  * The thread starts in the BB project linked to the issue's Jira project.
  * With several linked projects the user picks one; with none, they pick any
@@ -850,6 +863,22 @@ function SendToAgentDialog({
   const [linkProject, setLinkProject] = useState(true);
   const [worktree, setWorktree] = useState(false);
   const [hostId, setHostId] = useState("");
+  // Null while the project's defaults load, so the picker never starts on a
+  // default that is about to be replaced under the user.
+  const [execution, setExecution] = useState<ExperimentalProviderModelPickerValue | null>(null);
+
+  useEffect(() => {
+    if (!open || bbProjectId.length === 0) return;
+    let live = true;
+    setExecution(null);
+    rpc.call("executionDefaults", { bbProjectId }).then(
+      (defaults) => live && setExecution(defaults ?? UNPICKED_EXECUTION),
+      () => live && setExecution(UNPICKED_EXECUTION),
+    );
+    return () => {
+      live = false;
+    };
+  }, [rpc, open, bbProjectId]);
 
   useEffect(() => {
     if (!open) return;
@@ -875,6 +904,10 @@ function SendToAgentDialog({
   // one project means nothing for the next.
   const hosts = targets?.all.find((project) => project.bbProjectId === bbProjectId)?.hosts ?? [];
   const chosenHostOffline = hosts.some((host) => host.hostId === hostId && !host.connected);
+  // Models come from the machine the thread will run on.
+  const runsOn = hosts.some((host) => host.hostId === hostId)
+    ? hostId
+    : (hosts.find((host) => host.isDefault)?.hostId ?? hosts[0]?.hostId);
   const chooseProject = (next: string) => {
     setBbProjectId(next);
     setHostId("");
@@ -891,6 +924,8 @@ function SendToAgentDialog({
         linkProject: !chosenIsLinked && linkProject,
         worktree,
         hostId: hosts.some((host) => host.hostId === hostId) ? hostId : "",
+        // A picker that never resolved a model leaves the project's defaults.
+        execution: execution !== null && execution.model.length > 0 ? execution : null,
       })
       .then(({ threadId }) => {
         onOpenChange(false);
@@ -998,6 +1033,23 @@ function SendToAgentDialog({
                 That machine is offline right now, so the chat cannot start on it.
               </p>
             ) : null}
+          </div>
+        ) : null}
+
+        {bbProjectId.length > 0 ? (
+          <div className="grid gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground">Model</span>
+            {execution === null ? (
+              <Skeleton className="h-9 w-full" />
+            ) : (
+              <ProviderModelPicker
+                value={execution}
+                onChange={setExecution}
+                {...(runsOn === undefined ? {} : { routing: { kind: "host", hostId: runsOn } as const })}
+                disabled={busy}
+                className="max-w-full"
+              />
+            )}
           </div>
         ) : null}
 

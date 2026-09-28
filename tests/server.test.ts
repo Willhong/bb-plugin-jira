@@ -457,6 +457,72 @@ describe("send to agent", () => {
     ]);
   });
 
+  it("leaves the agent to the project's defaults unless one is picked", async () => {
+    const harness = await loadWithProjects();
+    await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web" });
+    const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [Record<string, unknown>];
+    expect(spawn).not.toHaveProperty("providerId");
+    expect(spawn).not.toHaveProperty("model");
+  });
+
+  it("runs the picked agent, marked as the user's own choice", async () => {
+    const harness = await loadWithProjects();
+    await harness.callRpc("sendToAgent", {
+      key: "WEB-1",
+      bbProjectId: "proj-web",
+      execution: { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", serviceTier: "fast" },
+    });
+    const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [Record<string, unknown>];
+    expect(spawn).toMatchObject({
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
+        serviceTier: "explicit",
+      },
+    });
+  });
+
+  it("refuses a malformed agent pick without spawning", async () => {
+    const harness = await loadWithProjects();
+    await expect(
+      harness.callRpc("sendToAgent", {
+        key: "WEB-1",
+        bbProjectId: "proj-web",
+        execution: { providerId: "claude-code", model: "", reasoningLevel: "high" },
+      }),
+    ).rejects.toThrow();
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([]);
+  });
+
+  it("starts the model picker on the project's defaults", async () => {
+    const harness = await loadWithProjects();
+    harness.sdk.stub("projects.defaultExecutionOptions", async () => ({
+      providerId: "codex",
+      model: "gpt-5",
+      reasoningLevel: "medium",
+      serviceTier: "default",
+      permissionMode: "auto",
+    }));
+    expect(await harness.callRpc("executionDefaults", { bbProjectId: "proj-web" })).toEqual({
+      providerId: "codex",
+      model: "gpt-5",
+      reasoningLevel: "medium",
+      serviceTier: "default",
+    });
+    // No defaults, or none readable, leaves the picker to bb's own default.
+    harness.sdk.stub("projects.defaultExecutionOptions", async () => null);
+    expect(await harness.callRpc("executionDefaults", { bbProjectId: "proj-web" })).toBeNull();
+    harness.sdk.stub("projects.defaultExecutionOptions", async () => {
+      throw new Error("offline");
+    });
+    expect(await harness.callRpc("executionDefaults", { bbProjectId: "proj-web" })).toBeNull();
+  });
+
   it("refuses a machine the project is not checked out on", async () => {
     const harness = await loadWithProjects();
     await expect(

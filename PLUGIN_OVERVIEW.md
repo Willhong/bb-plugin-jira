@@ -33,7 +33,9 @@ a separate tool still searches all of Jira when you ask about something else.
 project. When none is linked, pick a project and link it in the same step. The
 chat runs in that project's checkout; tick **Work in a new worktree** to give
 the issue its own branch and checkout instead. When the project is checked out
-on more than one enrolled machine, pick which one runs it.
+on more than one enrolled machine, pick which one runs it. The **Model** picker
+starts on the project's default agent; change the provider, model, or
+reasoning level to run the issue on a different one.
 
 ## Requirements
 
