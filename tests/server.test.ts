@@ -474,6 +474,119 @@ describe("send to agent", () => {
   });
 });
 
+// A done issue has no more work in it, so the threads "Send to agent" started
+// for it are filed away on BB Sidebar's settled shelf. Sidebar is optional:
+// every failure here leaves the transition itself alone.
+describe("settling threads when an issue is done", () => {
+  async function loadWithThread(settings: Record<string, string | boolean> = {}) {
+    const host = createFakePluginHost({
+      pluginId: "jira",
+      settings: { ...CONFIGURED, ...settings },
+      sdk: {
+        hosts: { list: async () => [makeHostResponse({ id: "host-laptop", name: "laptop", status: "connected" })] },
+        projects: {
+          list: async () => [
+            { id: "proj-web", name: "web-app", sources: [{ hostId: "host-laptop", isDefault: true, path: "/src/web" }] },
+          ],
+        },
+        threads: { spawn: async () => ({ id: "thr-web-1" }) },
+        plugins: { callRpc: async () => ({ ok: true }) },
+      },
+    } as Parameters<typeof createFakePluginHost>[0]);
+    await plugin(host.bb);
+    jira.fetchImpl.mockImplementation(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname;
+      if (path === "/rest/api/3/issue/WEB-1/comment") return new Response(JSON.stringify({ comments: [], total: 0 }));
+      return fakeJira().fetchImpl(url, init);
+    });
+    await host.harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web" });
+    return host.harness;
+  }
+
+  const settleCalls = (harness: Awaited<ReturnType<typeof loadWithThread>>) =>
+    harness.sdk.callsTo("plugins.callRpc").map(([args]) => {
+      const call = args as { pluginId: string; method: string; input: unknown };
+      return { pluginId: call.pluginId, method: call.method, input: call.input };
+    });
+
+  it("settles the issue's threads once it moves to a done status", async () => {
+    const harness = await loadWithThread();
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" });
+    expect(settleCalls(harness)).toEqual([
+      { pluginId: "bb-sidebar", method: "settle", input: { threadId: "thr-web-1" } },
+    ]);
+  });
+
+  it("leaves a thread alone for a transition that is not done", async () => {
+    const harness = await loadWithThread();
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "In Progress" });
+    expect(settleCalls(harness)).toEqual([]);
+  });
+
+  it("settles each thread once, so a later transition cannot overrule the user", async () => {
+    const harness = await loadWithThread();
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" });
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" });
+    expect(settleCalls(harness)).toHaveLength(1);
+  });
+
+  it("re-reads the issue when the caller only names a transition id", async () => {
+    const harness = await loadWithThread();
+    // The board hands over a bare transition id, so the new status is only
+    // knowable from the issue itself.
+    let moved = false;
+    jira.fetchImpl.mockImplementation(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname;
+      const method = init.method ?? "GET";
+      if (method === "POST" && path.endsWith("/transitions")) {
+        moved = true;
+        return new Response(null, { status: 204 });
+      }
+      if (moved && path === "/rest/api/3/issue/WEB-1") {
+        return new Response(
+          JSON.stringify({
+            id: "10001",
+            key: "WEB-1",
+            fields: {
+              summary: "Fix login",
+              status: { name: "Done", statusCategory: { key: "done" } },
+              issuetype: { name: "Bug" },
+              assignee: null,
+              reporter: ME,
+              project: { key: "WEB" },
+            },
+          }),
+        );
+      }
+      return fakeJira().fetchImpl(url, init);
+    });
+
+    await harness.callRpc("transitionIssue", { key: "WEB-1", transitionId: "31" });
+    expect(settleCalls(harness)).toEqual([
+      { pluginId: "bb-sidebar", method: "settle", input: { threadId: "thr-web-1" } },
+    ]);
+  });
+
+  it("respects the setting", async () => {
+    const harness = await loadWithThread({ settle_on_done: false });
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" });
+    expect(settleCalls(harness)).toEqual([]);
+  });
+
+  it("completes the transition when BB Sidebar is not installed", async () => {
+    const harness = await loadWithThread();
+    harness.sdk.stub("plugins.callRpc", async () => {
+      throw new Error("plugin bb-sidebar is not installed");
+    });
+    expect(await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" })).toEqual({ ok: true });
+    expect(harness.logEntries.some((entry) => entry.message.includes("Could not settle thr-web-1"))).toBe(true);
+    // Unsettled, so a later transition tries again.
+    harness.sdk.stub("plugins.callRpc", async () => ({ ok: true }));
+    await harness.callRpc("moveIssue", { key: "WEB-1", toStatus: "Done" });
+    expect(settleCalls(harness)).toHaveLength(2);
+  });
+});
+
 describe("configuration", () => {
   it("reports missing credentials without calling Jira", async () => {
     const harness = await load({});

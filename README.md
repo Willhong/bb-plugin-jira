@@ -17,6 +17,7 @@ For development, install a checkout in place with `bb plugin install .`.
 | `email` | Atlassian account email for the token. |
 | `apiToken` | API token (secret; server only). |
 | `allow_create`, `allow_update`, `allow_transition`, `allow_comment`, `allow_assign`, `allow_delete` | `Ask every time` (default) or `Always allow`, for agent writes. |
+| `settle_on_done` | Settle the issue's agent threads in BB Sidebar when it reaches a done status (default on). |
 
 ```sh
 bb plugin config jira set siteUrl acme.atlassian.net
@@ -37,6 +38,19 @@ threads:
 - Agents get an instruction naming the linked projects.
 
 Links live in plugin storage (`project-links`); unlinked projects are unscoped.
+
+## Done issues settle their threads
+
+When an issue reaches a **done** status through this plugin — the board, the
+issue view, or `jira_transition_issue` — every thread **Send to agent** started
+for it is settled in [BB Sidebar](https://github.com/Willhong/bb-sidebar)
+(`bb.sdk.plugins.callRpc` → its `settle` rpc), which also releases the thread's
+runtime and terminals. Each thread settles at most once, so un-settling it
+afterwards sticks. Sidebar is optional: without it the transition is unaffected
+and the attempt is only logged. Turn it off with `settle_on_done`.
+
+A status change made outside BB (Jira's own web UI, another tool) is not seen —
+there is no polling.
 
 ## Write rules
 

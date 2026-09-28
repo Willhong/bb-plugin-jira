@@ -36,6 +36,7 @@ import {
   type JiraIssue,
   type JiraIssueSummary,
   type JiraUser,
+  type StatusCategory,
   type WriteAction,
 } from "./jira.js";
 
@@ -46,6 +47,13 @@ const LINKS_CHANGED = "links-changed";
 /** kv: Record<bbProjectId, jiraProjectKey[]> */
 const LINKS_KEY = "project-links";
 const AGENT_SEARCH_MAX = 50;
+/**
+ * The BB Sidebar plugin, whose `settle` rpc files a thread away on its settled
+ * shelf as an explicit user choice. Optional: an install without it, or with it
+ * disabled, just never settles anything.
+ */
+const SIDEBAR_PLUGIN_ID = "bb-sidebar";
+const sidebarSettleResult = z.object({ ok: z.boolean() });
 
 const CONFIG_HINT =
   "Set your Jira site, account email, and an API token (id.atlassian.com → Security → API tokens) in the Jira plugin settings.";
@@ -135,6 +143,13 @@ export interface AgentTargets {
 export interface ThreadLink {
   threadId: string;
   createdAt: string;
+  /**
+   * When the issue reaching a done status settled this thread in BB Sidebar.
+   * Set once and never cleared: a user who un-settles the thread afterwards
+   * has overruled the issue, and a later transition must not overrule them
+   * back. Absent on links written before this existed.
+   */
+  settledAt?: string;
 }
 
 export const jiraRpcContract = defineRpcContract({
@@ -469,6 +484,13 @@ export default async function plugin(bb: BbPluginApi) {
       options: PERMISSION_OPTIONS,
       default: PERMISSION_ASK,
     },
+    settle_on_done: {
+      type: "boolean",
+      label: "Settle threads when an issue is done",
+      description:
+        "When an issue moves to a done status here, settle the agent threads Send to agent started for it. Needs the BB Sidebar plugin; without it nothing happens.",
+      default: true,
+    },
   });
 
   async function client(): Promise<JiraClient> {
@@ -718,6 +740,59 @@ export default async function plugin(bb: BbPluginApi) {
     return thread.id;
   }
 
+  /**
+   * File this issue's agent threads away once the issue is done.
+   *
+   * Called from every path that transitions an issue inside BB. `toCategory`
+   * is what the chosen transition lands in when the caller knows it; the rpc
+   * that takes a bare transition id does not, so the issue is re-read — but
+   * only after the cheap checks, so an issue nobody sent to an agent costs no
+   * Jira request at all.
+   *
+   * A settle is best-effort by design: BB Sidebar is optional, and a thread
+   * that cannot be settled must not turn a completed transition into an error.
+   */
+  async function settleDoneIssueThreads(
+    key: string,
+    toCategory?: StatusCategory,
+  ): Promise<void> {
+    const links = (await bb.storage.kv.get<ThreadLink[]>(`threads:${key}`)) ?? [];
+    const pending = links.filter((link) => link.settledAt === undefined);
+    if (pending.length === 0) return;
+    if ((await settings.get()).settle_on_done !== true) return;
+    const category =
+      toCategory ?? (await (await client()).getIssue(key)).statusCategory;
+    if (category !== "done") return;
+
+    const settled = new Set<string>();
+    for (const link of pending) {
+      try {
+        await bb.sdk.plugins.callRpc({
+          pluginId: SIDEBAR_PLUGIN_ID,
+          method: "settle",
+          input: { threadId: link.threadId },
+          outputSchema: sidebarSettleResult,
+        });
+        settled.add(link.threadId);
+      } catch (error) {
+        bb.log.warn(
+          `Could not settle ${link.threadId} for ${key}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (settled.size === 0) return;
+
+    // Re-read: a Send to agent during the calls above appends to the same key.
+    const current = (await bb.storage.kv.get<ThreadLink[]>(`threads:${key}`)) ?? [];
+    const settledAt = new Date().toISOString();
+    await bb.storage.kv.set(
+      `threads:${key}`,
+      current.map((link) =>
+        settled.has(link.threadId) ? { ...link, settledAt } : link,
+      ),
+    );
+  }
+
   // Report an unconfigured install up front instead of on first use.
   try {
     await (await client()).myself();
@@ -837,6 +912,7 @@ export default async function plugin(bb: BbPluginApi) {
     async transitionIssue({ key, transitionId }) {
       await (await client()).transitionIssue(key, transitionId);
       published(key);
+      await settleDoneIssueThreads(key);
       return { ok: true as const };
     },
 
@@ -853,6 +929,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       await jira.transitionIssue(key, matched.transition.id);
       published(key);
+      await settleDoneIssueThreads(key, matched.transition.toCategory);
       return { ok: true as const };
     },
 
@@ -1140,6 +1217,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (refusal !== null) return toolError(refusal);
         await jira.transitionIssue(key, matched.transition.id);
         published(key);
+        await settleDoneIssueThreads(key, matched.transition.toCategory);
         return `Moved ${key} to ${matched.transition.toStatus}.`;
       } catch (error) {
         return toolError(error);
