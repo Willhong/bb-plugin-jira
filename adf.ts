@@ -36,12 +36,16 @@ export interface AdfDoc {
 const INLINE_PATTERN =
   /(`[^`]+`)|(\[[^\]]+\]\([^)\s]+\))|(\*\*[^*]+\*\*)|(__[^_]+__)|(~~[^~]+~~)|(\*[^*\s][^*]*\*)|(_[^_\s][^_]*_)/;
 
+// ADF lets a `code` mark combine only with `link`; Jira rejects the whole
+// document (400 INVALID_INPUT) otherwise. So `**see `x`**` keeps `x` as code
+// and leaves that span unbolded rather than failing the write.
 function withMark(nodes: AdfNode[], mark: AdfMark): AdfNode[] {
-  return nodes.map((node) =>
-    node.type === "text"
-      ? { ...node, marks: [...(node.marks ?? []), mark] }
-      : node,
-  );
+  return nodes.map((node) => {
+    if (node.type !== "text") return node;
+    const isCode = node.marks?.some((existing) => existing.type === "code") ?? false;
+    if (isCode && mark.type !== "link") return node;
+    return { ...node, marks: [...(node.marks ?? []), mark] };
+  });
 }
 
 export function inlineToAdf(text: string): AdfNode[] {

@@ -2,6 +2,17 @@ import { describe, expect, it } from "vitest";
 import { adfToMarkdown, markdownToAdf } from "../adf";
 
 describe("markdown -> ADF", () => {
+  it("never puts strong/em/strike on a code span, which Jira rejects", () => {
+    const doc = markdownToAdf("**see `x` here** and *[`y`](https://x.dev)*");
+    expect(doc.content[0].content).toEqual([
+      { type: "text", text: "see ", marks: [{ type: "strong" }] },
+      { type: "text", text: "x", marks: [{ type: "code" }] },
+      { type: "text", text: " here", marks: [{ type: "strong" }] },
+      { type: "text", text: " and " },
+      { type: "text", text: "y", marks: [{ type: "code" }, { type: "link", attrs: { href: "https://x.dev" } }] },
+    ]);
+  });
+
   it("builds headings, paragraphs with hard breaks, and inline marks", () => {
     const doc = markdownToAdf("# Title\n\nSee **bold** and `code`\nnext line [docs](https://x.dev)");
     expect(doc).toEqual({
