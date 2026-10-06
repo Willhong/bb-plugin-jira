@@ -20,6 +20,7 @@ export const ACTION_ROWS: Array<{ action: WriteAction; label: string; hint: stri
   { action: "transition", label: "Change status", hint: "Workflow transitions" },
   { action: "comment", label: "Add or edit comments", hint: "jira_add_comment, jira_update_comment" },
   { action: "assign", label: "Change assignee", hint: "jira_assign_issue" },
+  { action: "sprint", label: "Move issues between sprints", hint: "jira_move_to_sprint" },
   { action: "delete", label: "Delete issues or comments", hint: "Permanent" },
 ];
 

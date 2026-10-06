@@ -11,7 +11,15 @@ import {
   type ExperimentalProviderModelPickerValue,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { AgentTargets, JiraComment, JiraIssue, JiraIssueDetail, JiraUser } from "../../server";
+import type {
+  AgentTargets,
+  IssueSprints,
+  JiraComment,
+  JiraIssue,
+  JiraIssueDetail,
+  JiraSprint,
+  JiraUser,
+} from "../../server";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -467,6 +475,9 @@ function FieldsPanel({ detail, currentUser }: { detail: JiraIssueDetail; current
         <FieldRow label="Assignee">
           <AssigneeControl issue={issue} currentUser={currentUser} />
         </FieldRow>
+        <FieldRow label="Sprint">
+          <SprintControl issue={issue} />
+        </FieldRow>
         <FieldRow label="Priority">
           <PriorityControl issue={issue} />
         </FieldRow>
@@ -563,6 +574,92 @@ function StatusControl({ detail }: { detail: JiraIssueDetail }) {
             </DropdownMenuItem>
           ))
         )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function sprintLabel(sprint: JiraSprint): string {
+  return sprint.state === "active" ? `${sprint.name} (active)` : sprint.name;
+}
+
+function SprintControl({ issue }: { issue: JiraIssue }) {
+  const rpc = useJiraRpc();
+  const [sprints, setSprints] = useState<IssueSprints | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [pending, setPending] = useState<JiraSprint | "backlog" | null>(null);
+
+  // issue.updated changes when the sprint moves (here, from Jira, or by an agent),
+  // and the detail view refetches the issue on every issue-changed event.
+  useEffect(() => {
+    let live = true;
+    rpc.call("issueSprints", { key: issue.key }).then(
+      (found) => {
+        if (!live) return;
+        setSprints(found);
+        setFailed(false);
+      },
+      () => live && setFailed(true),
+    );
+    return () => {
+      live = false;
+    };
+  }, [rpc, issue.key, issue.updated]);
+
+  if (failed) return <span className="pt-0.5 text-muted-foreground">—</span>;
+  if (sprints === null) return <span className="pt-0.5 text-xs text-muted-foreground">Loading…</span>;
+
+  const shown = pending === null ? sprints.current : pending === "backlog" ? null : pending;
+  const move = (target: JiraSprint | null) => {
+    setPending(target ?? "backlog");
+    rpc
+      .call("moveToSprint", { key: issue.key, sprintId: target?.id ?? null })
+      .then(() => setSprints((prev) => (prev ? { ...prev, current: target } : prev)))
+      .catch((error: unknown) => toast.error(errorText(error)))
+      .finally(() => setPending(null));
+  };
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          disabled={pending !== null}
+          aria-label={`Sprint: ${shown ? shown.name : "Backlog"}. Change sprint`}
+          className="-mx-1 flex w-[calc(100%+0.5rem)] items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-state-hover disabled:opacity-60"
+        >
+          <span className={cn("min-w-0 flex-1 truncate", shown === null && "text-muted-foreground")}>
+            {shown ? sprintLabel(shown) : "Backlog"}
+          </span>
+          <Icon name="ChevronDown" className="size-4 shrink-0 text-muted-foreground" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-52">
+        <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+          Move to
+        </DropdownMenuLabel>
+        {sprints.options.length === 0 ? (
+          <DropdownMenuItem disabled>No open sprints</DropdownMenuItem>
+        ) : (
+          sprints.options.map((sprint) => (
+            <DropdownMenuItem
+              key={sprint.id}
+              disabled={sprint.id === sprints.current?.id}
+              onSelect={() => move(sprint)}
+            >
+              <span className="truncate">{sprintLabel(sprint)}</span>
+              {sprint.endDate ? (
+                <span className="ml-auto pl-3 text-xs text-muted-foreground">
+                  ~{sprint.endDate.slice(5, 10)}
+                </span>
+              ) : null}
+            </DropdownMenuItem>
+          ))
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={sprints.current === null} onSelect={() => move(null)}>
+          Backlog
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );

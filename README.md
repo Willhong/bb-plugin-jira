@@ -16,7 +16,7 @@ For development, install a checkout in place with `bb plugin install .`.
 | `siteUrl` | `acme`, `acme.atlassian.net`, or the full https URL. |
 | `email` | Atlassian account email for the token. |
 | `apiToken` | API token (secret; server only). |
-| `allow_create`, `allow_update`, `allow_transition`, `allow_comment`, `allow_assign`, `allow_delete` | `Ask every time` (default) or `Always allow`, for agent writes. |
+| `allow_create`, `allow_update`, `allow_transition`, `allow_comment`, `allow_assign`, `allow_sprint`, `allow_delete` | `Ask every time` (default) or `Always allow`, for agent writes. |
 | `settle_on_done` | Settle the issue's agent threads in BB Sidebar when it reaches a done status (default on). |
 
 ```sh

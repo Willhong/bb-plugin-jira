@@ -69,6 +69,30 @@ function fakeJira() {
         ]);
       case "POST /rest/api/3/search/jql":
         return json({ issues: [issue], isLast: true });
+      case "GET /rest/agile/1.0/board":
+        return json({
+          values: [
+            { id: 7, name: "WEB board", type: "scrum" },
+            { id: 8, name: "WEB kanban", type: "kanban" },
+          ],
+          isLast: true,
+        });
+      case "GET /rest/agile/1.0/board/7/sprint":
+        return json({
+          values: [
+            { id: 41, name: "WEB Sprint 4", state: "active", originBoardId: 7, startDate: "2026-10-01T00:00:00.000Z", endDate: "2026-10-14T00:00:00.000Z" },
+            { id: 42, name: "WEB Sprint 5", state: "future", originBoardId: 7 },
+          ].filter((sprint) => (parsed.searchParams.get("state") ?? "").split(",").includes(sprint.state)),
+          isLast: true,
+        });
+      case "GET /rest/agile/1.0/issue/WEB-1":
+        return json({ key: "WEB-1", fields: { sprint: { id: 41, name: "WEB Sprint 4", state: "active", originBoardId: 7 } } });
+      case "GET /rest/agile/1.0/sprint/40":
+        return json({ id: 40, name: "WEB Sprint 3", state: "closed", originBoardId: 7 });
+      case "POST /rest/agile/1.0/sprint/41/issue":
+      case "POST /rest/agile/1.0/sprint/42/issue":
+      case "POST /rest/agile/1.0/backlog/issue":
+        return new Response(null, { status: 204 });
       default:
         return json({ errorMessages: [`unexpected ${route}`] }, 404);
     }
@@ -729,5 +753,78 @@ describe("matching helpers", () => {
     expect(matchTransition(transitions, "21")).toEqual({ transition: transitions[0] });
     expect(matchTransition(transitions, "start work")).toEqual({ transition: transitions[0] });
     expect(matchTransition(transitions, "in progress")).toEqual({ transition: transitions[0] });
+  });
+});
+
+describe("sprints", () => {
+  it("lists active and future sprints of scrum boards only", async () => {
+    const harness = await load();
+    const result = await harness.callAgentTool("jira_list_sprints", { projectKey: "WEB" });
+    expect(result).toContain("41\tactive\t7\tWEB Sprint 4\t2026-10-01 → 2026-10-14");
+    expect(result).toContain("42\tfuture\t7\tWEB Sprint 5");
+    expect(jira.calls.some((call) => call.path === "/rest/agile/1.0/board/8/sprint")).toBe(false);
+  });
+
+  it("moves issues into the active sprint only after approval", async () => {
+    const harness = await load();
+    const result = harness.callAgentTool("jira_move_to_sprint", { keys: ["WEB-1"], sprint: "active" });
+    const prompt = await waitFor(() => harness.pendingInteractions[0]);
+    expect(prompt.payload).toMatchObject({
+      action: "sprint",
+      issueKey: "WEB-1",
+      details: [{ label: "To", value: 'sprint 41 "WEB Sprint 4" (active)' }, { label: "WEB-1", value: "Fix login" }],
+    });
+    expect(jira.writes()).toEqual([]);
+    harness.submitInteraction(prompt.id, "once");
+    expect(await result).toBe('Moved WEB-1 to sprint 41 "WEB Sprint 4" (active).');
+    expect(jira.writes()).toEqual([
+      { method: "POST", path: "/rest/agile/1.0/sprint/41/issue", body: { issues: ["WEB-1"] } },
+    ]);
+  });
+
+  it("resolves a sprint by exact name and moves to the backlog", async () => {
+    const harness = await load({ ...CONFIGURED, allow_sprint: PERMISSION_ALWAYS });
+    expect(await harness.callAgentTool("jira_move_to_sprint", { keys: ["WEB-1"], sprint: "web sprint 5" })).toBe(
+      'Moved WEB-1 to sprint 42 "WEB Sprint 5" (future).',
+    );
+    expect(await harness.callAgentTool("jira_move_to_sprint", { keys: ["WEB-1"], sprint: "backlog" })).toBe(
+      "Moved WEB-1 to the backlog.",
+    );
+    expect(jira.writes().map((call) => call.path)).toEqual([
+      "/rest/agile/1.0/sprint/42/issue",
+      "/rest/agile/1.0/backlog/issue",
+    ]);
+  });
+
+  it("refuses an unknown name or a closed sprint without writing", async () => {
+    const harness = await load({ ...CONFIGURED, allow_sprint: PERMISSION_ALWAYS });
+    const unknown = await harness.callAgentTool("jira_move_to_sprint", { keys: ["WEB-1"], sprint: "Sprint 9" });
+    expect(JSON.stringify(unknown)).toContain('No open sprint matches \\"Sprint 9\\"');
+    const closed = await harness.callAgentTool("jira_move_to_sprint", { keys: ["WEB-1"], sprint: "40" });
+    expect(JSON.stringify(closed)).toContain("is closed");
+    expect(jira.writes()).toEqual([]);
+  });
+});
+
+describe("sprint rpc for the issue view", () => {
+  it("returns the current sprint and the open sprints", async () => {
+    const harness = await load();
+    const result = (await harness.callRpc("issueSprints", { key: "WEB-1" })) as {
+      current: { id: number } | null;
+      options: Array<{ id: number }>;
+    };
+    expect(result.current?.id).toBe(41);
+    expect(result.options.map((sprint) => sprint.id)).toEqual([41, 42]);
+  });
+
+  it("moves the issue to a sprint or the backlog without asking (the user's own action)", async () => {
+    const harness = await load();
+    await harness.callRpc("moveToSprint", { key: "WEB-1", sprintId: 42 });
+    await harness.callRpc("moveToSprint", { key: "WEB-1", sprintId: null });
+    expect(harness.pendingInteractions).toEqual([]);
+    expect(jira.writes()).toEqual([
+      { method: "POST", path: "/rest/agile/1.0/sprint/42/issue", body: { issues: ["WEB-1"] } },
+      { method: "POST", path: "/rest/agile/1.0/backlog/issue", body: { issues: ["WEB-1"] } },
+    ]);
   });
 });

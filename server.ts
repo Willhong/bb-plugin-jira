@@ -32,7 +32,10 @@ import {
   normalizeSiteUrl,
   requiresApproval,
   scopeJql,
+  SPRINT_MOVE_LIMIT,
+  type JiraBoard,
   type JiraComment,
+  type JiraSprint,
   type JiraIssue,
   type JiraIssueSummary,
   type JiraUser,
@@ -64,6 +67,7 @@ export type {
   JiraIssueSummary,
   JiraIssueType,
   JiraProject,
+  JiraSprint,
   JiraStatusOption,
   JiraTransition,
   JiraUser,
@@ -113,6 +117,12 @@ export interface JiraStatus {
   user: JiraUser | null;
   error: string | null;
   permissions: Record<WriteAction, "ask" | "always">;
+}
+
+export interface IssueSprints {
+  current: JiraSprint | null;
+  /** Active and future sprints of the issue's project scrum boards. */
+  options: JiraSprint[];
 }
 
 export interface JiraIssueDetail {
@@ -279,6 +289,16 @@ export const jiraRpcContract = defineRpcContract({
   },
   assignIssue: {
     input: z.object({ key: issueKeyInput, accountId: z.string().min(1).nullable() }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  /** The issue's current sprint and the open sprints it can move to. */
+  issueSprints: {
+    input: z.object({ key: issueKeyInput }).strict(),
+    output: anyOutput<IssueSprints>(),
+  },
+  /** sprintId null moves the issue back to the backlog. */
+  moveToSprint: {
+    input: z.object({ key: issueKeyInput, sprintId: z.number().int().positive().nullable() }).strict(),
     output: z.object({ ok: z.literal(true) }),
   },
   deleteIssue: {
@@ -501,6 +521,12 @@ export default async function plugin(bb: BbPluginApi) {
     allow_assign: {
       type: "select",
       label: "Agents: change assignee",
+      options: PERMISSION_OPTIONS,
+      default: PERMISSION_ASK,
+    },
+    allow_sprint: {
+      type: "select",
+      label: "Agents: move issues between sprints",
       options: PERMISSION_OPTIONS,
       default: PERMISSION_ASK,
     },
@@ -1010,6 +1036,24 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
 
+    async issueSprints({ key }) {
+      const jira = await client();
+      const projectKey = key.split("-")[0]!;
+      const [current, options] = await Promise.all([
+        jira.getIssueSprint(key),
+        sprintsFor(jira, projectKey, ["active", "future"]),
+      ]);
+      return { current, options };
+    },
+
+    async moveToSprint({ key, sprintId }) {
+      const jira = await client();
+      if (sprintId === null) await jira.moveIssuesToBacklog([key]);
+      else await jira.moveIssuesToSprint(sprintId, [key]);
+      published(key);
+      return { ok: true as const };
+    },
+
     async deleteIssue({ key, deleteSubtasks }) {
       await (await client()).deleteIssue(key, deleteSubtasks);
       await bb.storage.kv.delete(`threads:${key}`);
@@ -1433,6 +1477,131 @@ export default async function plugin(bb: BbPluginApi) {
         await jira.assignIssue(key, resolved.user?.accountId ?? null);
         published(key);
         return `Assigned ${key} to ${describeUser(resolved.user)}.`;
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // Sprints (Jira Software agile API).
+  // ------------------------------------------------------------------
+
+  const sprintStateParam = z.enum(["active", "future", "closed"]);
+
+  function describeSprint(sprint: JiraSprint): string {
+    const dates = [sprint.startDate?.slice(0, 10), sprint.endDate?.slice(0, 10)].filter(Boolean).join(" → ");
+    return `${sprint.id}\t${sprint.state}\t${sprint.boardId ?? ""}\t${sprint.name}${dates ? `\t${dates}` : ""}`;
+  }
+
+  /** Boards to search: the given one, or every board of the project. */
+  async function boardsFor(jira: JiraClient, projectKey: string, boardId?: number): Promise<JiraBoard[]> {
+    if (boardId !== undefined) return [{ id: boardId, name: `board ${boardId}`, type: "" }];
+    const boards = await jira.listBoards(projectKey);
+    // Kanban boards have no sprints; asking them for sprints is a 400.
+    return boards.filter((board) => board.type !== "kanban");
+  }
+
+  async function sprintsFor(
+    jira: JiraClient,
+    projectKey: string,
+    states: readonly ("active" | "future" | "closed")[],
+    boardId?: number,
+  ): Promise<JiraSprint[]> {
+    const seen = new Map<number, JiraSprint>();
+    for (const board of await boardsFor(jira, projectKey, boardId)) {
+      for (const sprint of await jira.listSprints(board.id, states)) seen.set(sprint.id, sprint);
+    }
+    return [...seen.values()];
+  }
+
+  bb.agents.registerTool({
+    name: "jira_list_sprints",
+    description:
+      "List the sprints of a Jira project's scrum boards (id, state, board, name, dates). Defaults to active and future sprints. Read-only.",
+    presentation: { label: { pending: "Listing Jira sprints", completed: "Listed Jira sprints" } },
+    parameters: z.object({
+      projectKey: z
+        .string()
+        .default("")
+        .describe("Project key, e.g. PROJ. Blank uses the Jira project linked to this BB project."),
+      states: z.array(sprintStateParam).min(1).default(["active", "future"]),
+      boardId: z.number().int().positive().optional().describe("Limit to one board."),
+    }),
+    async execute({ projectKey: rawProject, states, boardId }, ctx) {
+      try {
+        const projectKey = rawProject.trim().toUpperCase() || linkedKeys(ctx.projectId)[0] || "";
+        if (!isProjectKey(projectKey)) return toolError("Give a projectKey; this BB project is not linked to one.");
+        const jira = await client();
+        const sprints = await sprintsFor(jira, projectKey, states, boardId);
+        if (sprints.length === 0) return `No ${states.join("/")} sprints on ${projectKey}'s scrum boards.`;
+        return ["ID\tSTATE\tBOARD\tNAME\tDATES", ...sprints.slice(0, 50).map(describeSprint)].join("\n");
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "jira_move_to_sprint",
+    description:
+      'Move Jira issues into a sprint, or back to the backlog. sprint is a sprint id, an exact sprint name, "active" (the one active sprint), or "backlog". May pause for approval.',
+    instructions:
+      "Use jira_list_sprints when the target sprint is ambiguous. jira_move_to_sprint only moves issues into active or future sprints; closed sprints are refused by Jira.",
+    presentation: { label: { pending: "Moving Jira issues to sprint", completed: "Moved Jira issues to sprint" } },
+    parameters: z.object({
+      keys: z.array(z.string().min(1)).min(1).max(SPRINT_MOVE_LIMIT).describe("Issue keys, e.g. [PROJ-1, PROJ-2]."),
+      sprint: z
+        .string()
+        .min(1)
+        .describe('Sprint id, exact sprint name, "active", or "backlog".'),
+      boardId: z.number().int().positive().optional().describe("Board to resolve \"active\" or a name on."),
+    }),
+    async execute({ keys: rawKeys, sprint: rawSprint, boardId }, ctx) {
+      try {
+        const keys = [...new Set(rawKeys.map(parseKey))];
+        const projectKey = keys[0]!.split("-")[0]!;
+        const jira = await client();
+        const target = rawSprint.trim();
+        let sprint: JiraSprint | null = null;
+        if (target.toLowerCase() !== "backlog") {
+          if (/^\d+$/.test(target)) {
+            sprint = await jira.getSprint(Number(target));
+          } else {
+            const open = await sprintsFor(jira, projectKey, ["active", "future"], boardId);
+            const matches =
+              target.toLowerCase() === "active"
+                ? open.filter((s) => s.state === "active")
+                : open.filter((s) => s.name.trim().toLowerCase() === target.toLowerCase());
+            if (matches.length !== 1) {
+              const list = open.map(describeSprint).join("\n") || "(none)";
+              return toolError(
+                `${matches.length === 0 ? "No" : "More than one"} open sprint matches "${target}" on ${projectKey}. Pass a sprint id or boardId. Open sprints:\nID\tSTATE\tBOARD\tNAME\tDATES\n${list}`,
+              );
+            }
+            sprint = matches[0]!;
+          }
+          if (sprint.state === "closed") return toolError(`Sprint ${sprint.id} "${sprint.name}" is closed; Jira cannot move issues into it.`);
+        }
+        const issues = await Promise.all(keys.map((key) => jira.getIssue(key)));
+        const destination = sprint ? `sprint ${sprint.id} "${sprint.name}" (${sprint.state})` : "the backlog";
+        const refusal = await authorizeAgentWrite(
+          {
+            action: "sprint",
+            issueKey: keys[0]!,
+            summary: `Move ${keys.length === 1 ? keys[0] : `${keys.length} issues`} to ${destination}`,
+            details: [
+              { label: "To", value: destination },
+              ...issues.map((issue) => ({ label: issue.key, value: issue.summary })),
+            ],
+          },
+          ctx,
+        );
+        if (refusal !== null) return toolError(refusal);
+        if (sprint) await jira.moveIssuesToSprint(sprint.id, keys);
+        else await jira.moveIssuesToBacklog(keys);
+        for (const key of keys) published(key);
+        return `Moved ${keys.join(", ")} to ${destination}.`;
       } catch (error) {
         return toolError(error);
       }

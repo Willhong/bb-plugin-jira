@@ -69,6 +69,24 @@ export interface JiraProject {
   name: string;
 }
 
+export interface JiraBoard {
+  id: number;
+  name: string;
+  type: string;
+}
+
+export type SprintState = "active" | "future" | "closed";
+
+export interface JiraSprint {
+  id: number;
+  name: string;
+  state: SprintState;
+  boardId: number | null;
+  startDate: string | null;
+  endDate: string | null;
+  goal: string | null;
+}
+
 export interface JiraStatusOption {
   name: string;
   category: StatusCategory;
@@ -182,6 +200,46 @@ const rawIssueTypeSchema = z
     hierarchyLevel: z.number().optional(),
   })
   .loose();
+
+const rawBoardPageSchema = z
+  .object({
+    values: z.array(
+      z.object({ id: z.number(), name: z.string(), type: z.string().default("") }).passthrough(),
+    ),
+    isLast: z.boolean().optional(),
+  })
+  .passthrough();
+
+const rawSprintSchema = z
+  .object({
+    id: z.number(),
+    name: z.string(),
+    state: z.enum(["active", "future", "closed"]),
+    originBoardId: z.number().nullish(),
+    startDate: z.string().nullish(),
+    endDate: z.string().nullish(),
+    goal: z.string().nullish(),
+  })
+  .passthrough();
+
+const rawSprintPageSchema = z
+  .object({ values: z.array(rawSprintSchema), isLast: z.boolean().optional() })
+  .passthrough();
+
+function normalizeSprint(raw: z.infer<typeof rawSprintSchema>): JiraSprint {
+  return {
+    id: raw.id,
+    name: raw.name,
+    state: raw.state,
+    boardId: raw.originBoardId ?? null,
+    startDate: raw.startDate ?? null,
+    endDate: raw.endDate ?? null,
+    goal: raw.goal ? raw.goal : null,
+  };
+}
+
+/** Jira Software caps one sprint/backlog move at 50 issues. */
+export const SPRINT_MOVE_LIMIT = 50;
 
 const rawErrorSchema = z
   .object({
@@ -393,6 +451,7 @@ export const WRITE_ACTIONS = [
   "transition",
   "comment",
   "assign",
+  "sprint",
   "delete",
 ] as const;
 export type WriteAction = (typeof WRITE_ACTIONS)[number];
@@ -412,6 +471,7 @@ export const ACTION_LABELS: Record<WriteAction, string> = {
   transition: "Change status",
   comment: "Add or edit comments",
   assign: "Change assignee",
+  sprint: "Move issues between sprints",
   delete: "Delete issues or comments",
 };
 
@@ -693,6 +753,60 @@ export class JiraClient {
     await this.request("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}/assignee`, {
       accountId,
     });
+  }
+
+  /** Scrum and kanban boards of one project (Jira Software agile API). */
+  async listBoards(projectKey: string): Promise<JiraBoard[]> {
+    const params = new URLSearchParams({ projectKeyOrId: projectKey, maxResults: "50" });
+    const page = rawBoardPageSchema.parse(
+      await this.request("GET", `/rest/agile/1.0/board?${params}`),
+    );
+    return page.values.map((board) => ({ id: board.id, name: board.name, type: board.type }));
+  }
+
+  /** Sprints of one board in the given states, oldest first as Jira returns them. */
+  async listSprints(boardId: number, states: readonly SprintState[]): Promise<JiraSprint[]> {
+    const sprints: JiraSprint[] = [];
+    for (let startAt = 0; startAt < 1000; startAt += 50) {
+      const params = new URLSearchParams({
+        state: states.join(","),
+        startAt: String(startAt),
+        maxResults: "50",
+      });
+      const page = rawSprintPageSchema.parse(
+        await this.request("GET", `/rest/agile/1.0/board/${boardId}/sprint?${params}`),
+      );
+      sprints.push(...page.values.map(normalizeSprint));
+      if (page.isLast !== false || page.values.length === 0) break;
+    }
+    return sprints;
+  }
+
+  async getSprint(sprintId: number): Promise<JiraSprint> {
+    return normalizeSprint(
+      rawSprintSchema.parse(await this.request("GET", `/rest/agile/1.0/sprint/${sprintId}`)),
+    );
+  }
+
+  /** The issue's current (active or future) sprint, or null when it sits in the backlog. */
+  async getIssueSprint(key: string): Promise<JiraSprint | null> {
+    const raw = z
+      .object({ fields: z.object({ sprint: rawSprintSchema.nullish() }).passthrough() })
+      .passthrough()
+      .parse(
+        await this.request("GET", `/rest/agile/1.0/issue/${encodeURIComponent(key)}?fields=sprint`),
+      );
+    return raw.fields.sprint ? normalizeSprint(raw.fields.sprint) : null;
+  }
+
+  /** Move up to 50 issues into a sprint (it must be active or future). */
+  async moveIssuesToSprint(sprintId: number, keys: readonly string[]): Promise<void> {
+    await this.request("POST", `/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: keys });
+  }
+
+  /** Move up to 50 issues out of any sprint, back to the backlog. */
+  async moveIssuesToBacklog(keys: readonly string[]): Promise<void> {
+    await this.request("POST", "/rest/agile/1.0/backlog/issue", { issues: keys });
   }
 
   async findAssignableUsers(
