@@ -1,6 +1,6 @@
 ---
 name: jira
-description: Read and change Jira Cloud issues with the jira_* agent tools — search with JQL, read an issue with its comments, create, edit fields, move status, comment, assign, or delete. Use when the user mentions a Jira issue key (PROJ-123), asks what is assigned to them, or wants work reflected back into Jira.
+description: Read and change Jira Cloud issues with the jira_* agent tools — search with JQL, read an issue with its comments, create, edit fields, move status, add/edit/delete comments, assign, or delete. Use when the user mentions a Jira issue key (PROJ-123), asks what is assigned to them, or wants work reflected back into Jira.
 ---
 
 # Jira
@@ -14,7 +14,8 @@ description: Read and change Jira Cloud issues with the jira_* agent tools — s
   projects** (the first output line names the scope); leave `project = …` out.
 - `jira_search_all_issues` — the same, across every Jira project. Use it only
   when the user asks about issues outside the linked projects.
-- `jira_get_issue` — fields, the description as Markdown, the latest comments,
+- `jira_get_issue` — fields, the description as Markdown, the latest comments
+  (each headed `[comment <id>]`),
   and the transitions available right now. Read it before transitioning or
   editing so you use real status names.
 
@@ -25,11 +26,18 @@ description: Read and change Jira Cloud issues with the jira_* agent tools — s
 | `jira_create_issue` | New issue. `projectKey` defaults to the linked Jira project when there is exactly one. `assignee` takes `me`, a name, or an email. |
 | `jira_update_issue` | Summary, description, priority, labels. `description` and `labels` **replace** the current value — read first and send the full result. |
 | `jira_transition_issue` | Status, by transition name or target status (`Done`, `In Progress`). |
-| `jira_add_comment` | Markdown comment. |
+| `jira_add_comment` | Markdown comment. Returns the new comment id. |
+| `jira_update_comment` | Replace a comment's body (full Markdown). Fix a posted comment this way instead of adding a correction. |
+| `jira_delete_comment` | Permanent. Only when the user asked, e.g. to merge split comments. |
 | `jira_assign_issue` | `me`, `unassigned`, a name, or an email. |
 | `jira_delete_issue` | Permanent. Only when the user explicitly asked to delete. |
 
 Descriptions and comments are Markdown; the plugin converts to Jira's format.
+Inline code inside bold/italic stays code but loses the bold on that span —
+Jira's format does not allow both on one piece of text.
+
+Comment edits share the **comment** approval policy; comment deletes share
+the **delete** policy.
 
 ## Approval
 

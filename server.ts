@@ -388,7 +388,10 @@ export function formatIssue(
         : `Comments (${comments.length}):`,
     );
     for (const comment of comments) {
-      lines.push(`--- ${describeUser(comment.author)} at ${comment.created}`, comment.body);
+      lines.push(
+        `--- [comment ${comment.id}] ${describeUser(comment.author)} at ${comment.created}${comment.updated && comment.updated !== comment.created ? ` (edited ${comment.updated})` : ""}`,
+        comment.body,
+      );
     }
   }
   return lines.filter((line, index) => line !== "" || lines[index - 1] !== "").join("\n");
@@ -491,7 +494,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     allow_comment: {
       type: "select",
-      label: "Agents: add comments",
+      label: "Agents: add or edit comments",
       options: PERMISSION_OPTIONS,
       default: PERMISSION_ASK,
     },
@@ -503,7 +506,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     allow_delete: {
       type: "select",
-      label: "Agents: delete issues",
+      label: "Agents: delete issues or comments",
       options: PERMISSION_OPTIONS,
       default: PERMISSION_ASK,
     },
@@ -1307,9 +1310,90 @@ export default async function plugin(bb: BbPluginApi) {
           ctx,
         );
         if (refusal !== null) return toolError(refusal);
-        await (await client()).addComment(key, body);
+        const comment = await (await client()).addComment(key, body);
         published(key);
-        return `Commented on ${key}.`;
+        return `Commented on ${key} (comment ${comment.id}).`;
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  const commentIdParam = z
+    .string()
+    .regex(/^\d+$/, "A numeric Jira comment id, as shown by jira_get_issue.")
+    .describe("Comment id from jira_get_issue's `[comment <id>]` line or jira_add_comment's result.");
+
+  bb.agents.registerTool({
+    name: "jira_update_comment",
+    description:
+      "Replace the body of an existing Jira comment with new Markdown. Get the comment id from jira_get_issue. May pause for approval.",
+    instructions:
+      "Use jira_update_comment to fix or complete a comment already posted instead of adding a correction comment. Send the full new body; it replaces the old one.",
+    presentation: { label: { pending: "Editing Jira comment", completed: "Edited Jira comment" } },
+    parameters: z.object({
+      key: keyParam,
+      commentId: commentIdParam,
+      body: z.string().min(1).describe("Full replacement Markdown body."),
+    }),
+    async execute({ key: rawKey, commentId, body }, ctx) {
+      try {
+        const key = parseKey(rawKey);
+        const jira = await client();
+        const current = await jira.getComment(key, commentId);
+        const refusal = await authorizeAgentWrite(
+          {
+            action: "comment",
+            issueKey: key,
+            summary: `Edit comment ${commentId} on ${key}`,
+            details: [
+              { label: "Author", value: describeUser(current.author) },
+              { label: "Current", value: current.body },
+              { label: "New", value: body },
+            ],
+          },
+          ctx,
+        );
+        if (refusal !== null) return toolError(refusal);
+        await jira.updateComment(key, commentId, body);
+        published(key);
+        return `Edited comment ${commentId} on ${key}.`;
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "jira_delete_comment",
+    description:
+      "Permanently delete one Jira comment. This cannot be undone. May pause for approval.",
+    instructions:
+      "Only call jira_delete_comment when the user asked for that comment to be removed, or to fold a split or test comment into another one they asked you to merge.",
+    presentation: { label: { pending: "Deleting Jira comment", completed: "Deleted Jira comment" } },
+    parameters: z.object({ key: keyParam, commentId: commentIdParam }),
+    async execute({ key: rawKey, commentId }, ctx) {
+      try {
+        const key = parseKey(rawKey);
+        const jira = await client();
+        const current = await jira.getComment(key, commentId);
+        const refusal = await authorizeAgentWrite(
+          {
+            action: "delete",
+            issueKey: key,
+            summary: `Permanently delete comment ${commentId} on ${key}`,
+            details: [
+              { label: "Author", value: describeUser(current.author) },
+              { label: "Created", value: current.created },
+              { label: "Comment", value: current.body },
+            ],
+          },
+          ctx,
+        );
+        if (refusal !== null) return toolError(refusal);
+        await jira.deleteComment(key, commentId);
+        published(key);
+        return `Deleted comment ${commentId} on ${key}.`;
       } catch (error) {
         return toolError(error);
       }

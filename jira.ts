@@ -410,9 +410,9 @@ export const ACTION_LABELS: Record<WriteAction, string> = {
   create: "Create issues",
   update: "Edit issue fields",
   transition: "Change status",
-  comment: "Add comments",
+  comment: "Add or edit comments",
   assign: "Change assignee",
-  delete: "Delete issues",
+  delete: "Delete issues or comments",
 };
 
 /**
@@ -485,6 +485,20 @@ export function toJiraFields(input: IssueFieldsInput): Record<string, unknown> {
   if (input.priority !== undefined) fields.priority = { name: input.priority };
   if (input.labels !== undefined) fields.labels = input.labels;
   return fields;
+}
+
+function toComment(raw: z.infer<typeof rawCommentSchema>): JiraComment {
+  return {
+    id: raw.id,
+    author: normalizeUser(raw.author),
+    body: adfToMarkdown(raw.body),
+    created: raw.created ?? "",
+    updated: raw.updated ?? "",
+  };
+}
+
+function commentPath(key: string, commentId: string): string {
+  return `/rest/api/3/issue/${encodeURIComponent(key)}/comment/${encodeURIComponent(commentId)}`;
 }
 
 const ISSUE_FIELDS =
@@ -654,13 +668,25 @@ export class JiraClient {
         body: markdownToAdf(markdown),
       }),
     );
-    return {
-      id: raw.id,
-      author: normalizeUser(raw.author),
-      body: adfToMarkdown(raw.body),
-      created: raw.created ?? "",
-      updated: raw.updated ?? "",
-    };
+    return toComment(raw);
+  }
+
+  async getComment(key: string, commentId: string): Promise<JiraComment> {
+    return toComment(
+      rawCommentSchema.parse(await this.request("GET", commentPath(key, commentId))),
+    );
+  }
+
+  async updateComment(key: string, commentId: string, markdown: string): Promise<JiraComment> {
+    return toComment(
+      rawCommentSchema.parse(
+        await this.request("PUT", commentPath(key, commentId), { body: markdownToAdf(markdown) }),
+      ),
+    );
+  }
+
+  async deleteComment(key: string, commentId: string): Promise<void> {
+    await this.request("DELETE", commentPath(key, commentId));
   }
 
   async assignIssue(key: string, accountId: string | null): Promise<void> {

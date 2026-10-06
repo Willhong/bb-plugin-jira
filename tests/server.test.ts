@@ -54,6 +54,12 @@ function fakeJira() {
         return new Response(null, { status: 204 });
       case "POST /rest/api/3/issue/WEB-1/comment":
         return json({ id: "c1", author: ME, body: body?.body, created: "2026-09-17T00:00:00.000Z" }, 201);
+      case "GET /rest/api/3/issue/WEB-1/comment/10001":
+        return json({ id: "10001", author: ME, body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "old text" }] }] }, created: "2026-09-17T00:00:00.000Z" });
+      case "PUT /rest/api/3/issue/WEB-1/comment/10001":
+        return json({ id: "10001", author: ME, body: body?.body, created: "2026-09-17T00:00:00.000Z" });
+      case "DELETE /rest/api/3/issue/WEB-1/comment/10001":
+        return new Response(null, { status: 204 });
       case "DELETE /rest/api/3/issue/WEB-1":
         return new Response(null, { status: 204 });
       case "GET /rest/api/3/project/WEB/statuses":
@@ -97,6 +103,49 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("comment edit and delete", () => {
+  it("edits a comment only after approval, showing the current and new body", async () => {
+    const harness = await load();
+    const result = harness.callAgentTool("jira_update_comment", { key: "WEB-1", commentId: "10001", body: "new **text**" });
+    const prompt = await waitFor(() => harness.pendingInteractions[0]);
+    expect(prompt.payload).toMatchObject({
+      action: "comment",
+      issueKey: "WEB-1",
+      details: [
+        { label: "Author", value: expect.any(String) },
+        { label: "Current", value: "old text" },
+        { label: "New", value: "new **text**" },
+      ],
+    });
+    expect(jira.writes()).toEqual([]);
+    harness.submitInteraction(prompt.id, "once");
+    expect(await result).toBe("Edited comment 10001 on WEB-1.");
+    expect(jira.writes().map((call) => `${call.method} ${call.path}`)).toEqual([
+      "PUT /rest/api/3/issue/WEB-1/comment/10001",
+    ]);
+  });
+
+  it("gates comment deletes on the delete policy, not the comment policy", async () => {
+    const harness = await load({ ...CONFIGURED, allow_comment: "Always allow" });
+    const result = harness.callAgentTool("jira_delete_comment", { key: "WEB-1", commentId: "10001" });
+    const prompt = await waitFor(() => harness.pendingInteractions[0]);
+    expect(prompt.payload).toMatchObject({ action: "delete", issueKey: "WEB-1" });
+    harness.submitInteraction(prompt.id, "once");
+    expect(await result).toBe("Deleted comment 10001 on WEB-1.");
+    expect(jira.writes().map((call) => `${call.method} ${call.path}`)).toEqual([
+      "DELETE /rest/api/3/issue/WEB-1/comment/10001",
+    ]);
+  });
+
+  it("rejects a non-numeric comment id before calling Jira", async () => {
+    const harness = await load();
+    await expect(
+      harness.callAgentTool("jira_delete_comment", { key: "WEB-1", commentId: "../x" }),
+    ).rejects.toThrow(/comment id/i);
+    expect(jira.writes()).toEqual([]);
+  });
+});
+
 describe("agent write gate", () => {
   it("asks before writing, and writes only after the user allows once", async () => {
     const harness = await load();
@@ -112,7 +161,7 @@ describe("agent write gate", () => {
     expect(jira.writes()).toEqual([]);
 
     harness.submitInteraction(prompt.id, "once");
-    expect(await result).toBe("Commented on WEB-1.");
+    expect(await result).toBe("Commented on WEB-1 (comment c1).");
     expect(jira.writes().map((call) => `${call.method} ${call.path}`)).toEqual([
       "POST /rest/api/3/issue/WEB-1/comment",
     ]);
@@ -150,7 +199,7 @@ describe("agent write gate", () => {
 
     // Same action: no prompt this time.
     expect(await harness.callAgentTool("jira_add_comment", { key: "WEB-1", body: "two" })).toBe(
-      "Commented on WEB-1.",
+      "Commented on WEB-1 (comment c1).",
     );
     expect(await harness.callRpc("status", null)).toMatchObject({
       permissions: { comment: "always", delete: "ask", transition: "ask" },

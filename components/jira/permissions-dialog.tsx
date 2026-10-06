@@ -18,9 +18,9 @@ export const ACTION_ROWS: Array<{ action: WriteAction; label: string; hint: stri
   { action: "create", label: "Create issues", hint: "jira_create_issue" },
   { action: "update", label: "Edit fields", hint: "Summary, description, priority, labels" },
   { action: "transition", label: "Change status", hint: "Workflow transitions" },
-  { action: "comment", label: "Add comments", hint: "jira_add_comment" },
+  { action: "comment", label: "Add or edit comments", hint: "jira_add_comment, jira_update_comment" },
   { action: "assign", label: "Change assignee", hint: "jira_assign_issue" },
-  { action: "delete", label: "Delete issues", hint: "Permanent" },
+  { action: "delete", label: "Delete issues or comments", hint: "Permanent" },
 ];
 
 export function PermissionsDialog({
