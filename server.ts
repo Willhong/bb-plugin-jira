@@ -37,6 +37,7 @@ import {
   type JiraComment,
   type JiraSprint,
   type JiraIssue,
+  type JiraDependencies,
   type JiraIssueSummary,
   type JiraUser,
   type StatusCategory,
@@ -208,6 +209,10 @@ export const jiraRpcContract = defineRpcContract({
   getIssue: {
     input: z.object({ key: issueKeyInput }).strict(),
     output: anyOutput<JiraIssueDetail>(),
+  },
+  getDependencies: {
+    input: z.object({ key: z.string().min(1).max(64) }).strict(),
+    output: anyOutput<JiraDependencies>(),
   },
   listProjects: {
     input: z.null(),
@@ -934,6 +939,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     getIssue: ({ key }) => loadIssueDetail(key),
+    getDependencies: async ({ key }) => (await client()).getDependencies(parseKey(key)),
 
     listProjects: async () => (await client()).listProjects(),
 
@@ -1155,6 +1161,19 @@ export default async function plugin(bb: BbPluginApi) {
               : detail.transitions.map((t) => `${t.name} → ${t.toStatus}`).join(", ")
           }`,
         ].join("\n");
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "jira_get_dependencies",
+    description: "Read a Jira issue's blockedBy (prerequisites) and blocking (dependents) from Blocks links, with keys, titles, URLs, and current status/category. Read-only; a failed lookup never means no dependencies.",
+    parameters: z.object({ key: keyParam }),
+    async execute({ key }) {
+      try {
+        return JSON.stringify(await (await client()).getDependencies(parseKey(key)));
       } catch (error) {
         return toolError(error);
       }

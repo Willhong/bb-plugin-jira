@@ -18,10 +18,12 @@ interface Call {
 
 function fakeJira() {
   const calls: Call[] = [];
+  const dependencyIssues: Record<string, unknown> = {};
   const issue = {
     id: "10001",
     key: "WEB-1",
     fields: {
+      issuelinks: [] as unknown[],
       summary: "Fix login",
       status: { name: "To Do", statusCategory: { key: "new" } },
       issuetype: { name: "Bug" },
@@ -94,11 +96,12 @@ function fakeJira() {
       case "POST /rest/agile/1.0/backlog/issue":
         return new Response(null, { status: 204 });
       default:
+        if (method === "GET" && dependencyIssues[parsed.pathname]) return json(dependencyIssues[parsed.pathname]);
         return json({ errorMessages: [`unexpected ${route}`] }, 404);
     }
   });
   const writes = () => calls.filter((call) => call.method !== "GET" && call.path !== "/rest/api/3/search/jql");
-  return { calls, writes, fetchImpl };
+  return { calls, writes, fetchImpl, issue, dependencyIssues };
 }
 
 async function waitFor<T>(read: () => T | undefined): Promise<T> {
@@ -125,6 +128,60 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("dependency reads", () => {
+  it("keeps Blocks direction, resolves current cross-project states, and deduplicates", async () => {
+    const type = { name: "Blocks", inward: "is blocked by", outward: "blocks" };
+    jira.issue.fields.issuelinks = [
+      { type, inwardIssue: { key: "API-2", fields: { status: { name: "Stale snapshot" } } } },
+      { type, outwardIssue: { key: "WEB-3" } },
+      { type, inwardIssue: { key: "API-2" } },
+      { type: { name: "Relates", inward: "relates to", outward: "relates to" }, inwardIssue: { key: "WEB-99" } },
+      { type: { name: "Duplicate", inward: "is duplicated by", outward: "duplicates" }, outwardIssue: { key: "WEB-98" } },
+    ];
+    jira.dependencyIssues["/rest/api/3/issue/API-2"] = {
+      id: "10002", key: "API-2", fields: { summary: "Server shipped", project: { key: "API" }, status: { name: "Done", statusCategory: { key: "done" } } },
+    };
+    jira.dependencyIssues["/rest/api/3/issue/WEB-3"] = {
+      id: "10003", key: "WEB-3", fields: { summary: "Client waits", project: { key: "WEB" }, status: { name: "In Progress", statusCategory: { key: "indeterminate" } } },
+    };
+    const harness = await load();
+    const result = await harness.callRpc("getDependencies", { key: "web-1" });
+    expect(result).toEqual({
+      key: "WEB-1",
+      blockedBy: [{ id: "10002", key: "API-2", projectKey: "API", title: "Server shipped", url: `${SITE}/browse/API-2`, status: "Done", statusCategory: "done" }],
+      blocking: [{ id: "10003", key: "WEB-3", projectKey: "WEB", title: "Client waits", url: `${SITE}/browse/WEB-3`, status: "In Progress", statusCategory: "inprogress" }],
+    });
+    expect(jira.calls.filter((call) => call.path === "/rest/api/3/issue/API-2")).toHaveLength(1);
+    expect(JSON.parse(await harness.callAgentTool("jira_get_dependencies", { key: "WEB-1" }) as string)).toEqual(result);
+    expect(jira.writes()).toEqual([]);
+    expect(harness.pendingInteractions).toHaveLength(0);
+  });
+
+  it("returns a valid empty graph and rejects missing links or unreadable prerequisites", async () => {
+    const harness = await load();
+    expect(await harness.callRpc("getDependencies", { key: "WEB-1" })).toEqual({ key: "WEB-1", blockedBy: [], blocking: [] });
+    jira.issue.fields.issuelinks = undefined as never;
+    await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow();
+    jira.issue.fields.issuelinks = [{ type: { name: "Blocks", inward: "is blocked by", outward: "blocks" }, inwardIssue: { key: "API-2" } }];
+    await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow();
+    expect(jira.writes()).toEqual([]);
+  });
+
+  it("recognizes standard labels after a type rename, but refuses malformed directions and oversized graphs", async () => {
+    const harness = await load();
+    const type = { name: "Dependency", inward: "is blocked by", outward: "blocks" };
+    jira.issue.fields.issuelinks = [{ type, inwardIssue: { key: "API-2" } }];
+    jira.dependencyIssues["/rest/api/3/issue/API-2"] = {
+      id: "10002", key: "API-2", fields: { summary: "Prerequisite", project: { key: "API" }, status: { name: "Todo", statusCategory: { key: "new" } } },
+    };
+    expect(await harness.callRpc("getDependencies", { key: "WEB-1" })).toMatchObject({ blockedBy: [{ key: "API-2", statusCategory: "todo" }] });
+    jira.issue.fields.issuelinks = [{ type, inwardIssue: { key: "API-2" }, outwardIssue: { key: "WEB-3" } }];
+    await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow();
+    jira.issue.fields.issuelinks = Array.from({ length: 101 }, (_, i) => ({ type, inwardIssue: { key: `API-${i + 1}` } }));
+    await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow(/Too many Jira dependencies/);
+  });
 });
 
 describe("comment edit and delete", () => {

@@ -18,6 +18,23 @@ description: Read and change Jira Cloud issues with the jira_* agent tools — s
   (each headed `[comment <id>]`),
   and the transitions available right now. Read it before transitioning or
   editing so you use real status names.
+- `jira_get_dependencies {key}` — read-only JSON `{key, blockedBy, blocking}`
+  from Blocks links. Inward linked issues are prerequisites (`blockedBy`),
+  outward linked issues are dependents (`blocking`). Each has `id`, `key`,
+  `projectKey`, `title`, `url`, current `status` and native `statusCategory`
+  (`todo`, `inprogress`, `done`). Jira's `done` category alone does not
+  distinguish a cancelled status. Linked items can belong to other projects;
+  each distinct item is read once to get its current state. Relates-to,
+  duplicate and parent links do not count. A link type is recognized by
+  its name `Blocks` (case insensitive), or the descriptions `is blocked by`
+  and `blocks`; wholly renamed custom types need a separate mapping.
+  Missing/malformed links, unreadable items and more than 100 Blocks links
+  fail the read; they never yield a successful empty or partial graph.
+  This tool does not decide when to start.
+
+HongCore callers use `bb.rpc` with
+`{"method":"getDependencies","input":{"key":"PROJ-123"}}`. BB callers use
+the `getDependencies` RPC with `{key}`. Both return the same JSON as the tool.
 - `jira_list_sprints` lists a project's scrum-board sprints (id, state, board,
   name, dates); defaults to active and future. Use it before
   `jira_move_to_sprint` when the target sprint is unclear.

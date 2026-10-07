@@ -48,6 +48,44 @@ export interface JiraIssue extends JiraIssueSummary {
   url: string;
 }
 
+export interface JiraDependency {
+  id: string;
+  key: string;
+  projectKey: string;
+  title: string;
+  url: string;
+  status: string;
+  /** Native Jira category; done does not distinguish a cancelled status. */
+  statusCategory: StatusCategory;
+}
+
+export interface JiraDependencies {
+  key: string;
+  /** Items this issue is blocked by (inward end of a Blocks link). */
+  blockedBy: JiraDependency[];
+  /** Items this issue blocks (outward end of a Blocks link). */
+  blocking: JiraDependency[];
+}
+
+export const DEPENDENCY_MAX = 100;
+const dependencyLinksSchema = z.object({
+  key: z.string().min(1),
+  fields: z.object({
+    issuelinks: z.array(z.object({
+      type: z.object({ name: z.string(), inward: z.string(), outward: z.string() }).loose(),
+      inwardIssue: z.object({ key: z.string().min(1) }).loose().optional(),
+      outwardIssue: z.object({ key: z.string().min(1) }).loose().optional(),
+    }).loose().refine((link) => Boolean(link.inwardIssue) !== Boolean(link.outwardIssue), "Expected one linked end")),
+  }).loose(),
+}).loose();
+const dependencyItemSchema = z.object({
+  id: z.string().min(1), key: z.string().min(1),
+  fields: z.object({
+    summary: z.string(), project: z.object({ key: z.string().min(1) }).loose(),
+    status: z.object({ name: z.string(), statusCategory: z.object({ key: z.enum(["new", "indeterminate", "done"]) }).loose() }).loose(),
+  }).loose(),
+}).loose();
+
 export interface JiraComment {
   id: string;
   author: JiraUser | null;
@@ -648,6 +686,37 @@ export class JiraClient {
       ),
     );
     return normalizeIssue(raw, this.access.siteUrl);
+  }
+
+  async getDependencies(key: string): Promise<JiraDependencies> {
+    const raw = dependencyLinksSchema.parse(await this.request(
+      "GET", `/rest/api/3/issue/${encodeURIComponent(key)}?fields=issuelinks`,
+    ));
+    const links = raw.fields.issuelinks.filter(({ type }) =>
+      type.name.trim().toLowerCase() === "blocks" ||
+      (type.inward.trim().toLowerCase() === "is blocked by" && type.outward.trim().toLowerCase() === "blocks"),
+    );
+    if (links.length > DEPENDENCY_MAX) {
+      throw new Error(`Too many Jira dependencies (maximum ${DEPENDENCY_MAX}); no partial result was returned.`);
+    }
+    const blockedBy = [...new Set(links.flatMap((link) => link.inwardIssue ? [link.inwardIssue.key] : []))];
+    const blocking = [...new Set(links.flatMap((link) => link.outwardIssue ? [link.outwardIssue.key] : []))];
+    const keys = [...new Set([...blockedBy, ...blocking])];
+    const items = new Map<string, JiraDependency>();
+    // Link snapshots can omit statusCategory. Fetch each distinct issue's current state.
+    for (let offset = 0; offset < keys.length; offset += 5) {
+      await Promise.all(keys.slice(offset, offset + 5).map(async (key) => {
+        const issue = dependencyItemSchema.parse(await this.request(
+          "GET", `/rest/api/3/issue/${encodeURIComponent(key)}?fields=summary,project,status`,
+        ));
+        items.set(key, {
+          id: issue.id, key: issue.key, projectKey: issue.fields.project.key, title: issue.fields.summary,
+          url: `${this.access.siteUrl}/browse/${issue.key}`, status: issue.fields.status.name,
+          statusCategory: statusCategory(issue.fields.status.statusCategory.key),
+        });
+      }));
+    }
+    return { key: raw.key, blockedBy: blockedBy.map((key) => items.get(key)!), blocking: blocking.map((key) => items.get(key)!) };
   }
 
   async createIssue(input: CreateIssueInput): Promise<{ key: string }> {
