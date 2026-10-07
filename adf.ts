@@ -5,9 +5,9 @@
 // converts at the Jira boundary in both directions.
 //
 // The conversion covers what people actually type into an issue: paragraphs,
-// headings, bullet/ordered lists, code blocks, quotes, rules, and inline bold,
-// italic, strike, code, and links. Anything else Jira sends back (panels,
-// tables, media, mentions, emoji) degrades to its text rather than vanishing,
+// headings, bullet/ordered lists, code blocks, quotes, rules, GFM tables, and
+// inline bold, italic, strike, code, and links. Anything else Jira sends back
+// (panels, media, mentions, emoji) degrades to its text rather than vanishing,
 // so reading never silently drops content.
 
 export interface AdfMark {
@@ -33,8 +33,28 @@ export interface AdfDoc {
 // Markdown -> ADF
 // ---------------------------------------------------------------------------
 
-const INLINE_PATTERN =
-  /(`[^`]+`)|(\[[^\]]+\]\([^)\s]+\))|(\*\*[^*]+\*\*)|(__[^_]+__)|(~~[^~]+~~)|(\*[^*\s][^*]*\*)|(_[^_\s][^_]*_)/;
+// A code span opens and closes with backtick runs of equal length, so
+// ```` ``` ```` holds three backticks. One space of padding on each side is
+// dropped, as in CommonMark.
+const CODE_SPAN = /(`+)(?!`)([\s\S]*?[^`])\1(?!`)/;
+
+function codeSpanText(content: string): string {
+  return /^ [\s\S]* $/.test(content) && content.trim() !== "" ? content.slice(1, -1) : content;
+}
+
+/** Wraps text in a backtick run longer than any run inside it. */
+function codeSpan(text: string): string {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
+const INLINE_PATTERN = new RegExp(
+  // Wrapped as group 1, so the code span's own backreference shifts to \2.
+  `(${CODE_SPAN.source.replace("\\1", "\\2")})|` +
+    /(\[[^\]]+\]\([^)\s]+\))|(\*\*[^*]+\*\*)|(__[^_]+__)|(~~[^~]+~~)|(\*[^*\s][^*]*\*)|(_[^_\s][^_]*_)/.source,
+);
 
 // ADF lets a `code` mark combine only with `link`; Jira rejects the whole
 // document (400 INVALID_INPUT) otherwise. So `**see `x`**` keeps `x` as code
@@ -61,20 +81,21 @@ export function inlineToAdf(text: string): AdfNode[] {
       nodes.push({ type: "text", text: rest.slice(0, match.index) });
     }
     const token = match[0];
+    // Groups 2 and 3 are the code span's backtick run and content.
     if (match[1] !== undefined) {
       nodes.push({
         type: "text",
-        text: token.slice(1, -1),
+        text: codeSpanText(match[3] ?? ""),
         marks: [{ type: "code" }],
       });
-    } else if (match[2] !== undefined) {
+    } else if (match[4] !== undefined) {
       const split = token.indexOf("](");
       const label = token.slice(1, split);
       const href = token.slice(split + 2, -1);
       nodes.push(...withMark(inlineToAdf(label), { type: "link", attrs: { href } }));
-    } else if (match[3] !== undefined || match[4] !== undefined) {
+    } else if (match[5] !== undefined || match[6] !== undefined) {
       nodes.push(...withMark(inlineToAdf(token.slice(2, -2)), { type: "strong" }));
-    } else if (match[5] !== undefined) {
+    } else if (match[7] !== undefined) {
       nodes.push(...withMark(inlineToAdf(token.slice(2, -2)), { type: "strike" }));
     } else {
       nodes.push(...withMark(inlineToAdf(token.slice(1, -1)), { type: "em" }));
@@ -87,6 +108,73 @@ export function inlineToAdf(text: string): AdfNode[] {
 function paragraph(text: string): AdfNode {
   const content = inlineToAdf(text);
   return content.length > 0 ? { type: "paragraph", content } : { type: "paragraph" };
+}
+
+// GFM table: a header row, a `| --- | :-: |` delimiter row, then body rows.
+const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+
+/** Splits a table row on unescaped pipes outside code spans; `\|` becomes `|`. */
+export function splitTableRow(line: string): string[] {
+  let row = line.trim();
+  if (row.startsWith("|")) row = row.slice(1);
+  if (row.endsWith("|") && !row.endsWith("\\|")) row = row.slice(0, -1);
+  const cells: string[] = [];
+  let cell = "";
+  for (let position = 0; position < row.length; position += 1) {
+    const char = row[position];
+    if (char === "\\" && row[position + 1] === "|") {
+      cell += "|";
+      position += 1;
+    } else if (char === "`") {
+      // A code span runs to the next backtick run of the same length; pipes
+      // inside it stay text. An unmatched run is literal backticks.
+      const run = /^`+/.exec(row.slice(position))?.[0] ?? "`";
+      const close = new RegExp(`(?<!\`)${run}(?!\`)`).exec(row.slice(position + run.length));
+      const end = close === null ? position + run.length : position + run.length + close.index + run.length;
+      cell += row.slice(position, end).replace(/\\\|/g, "|");
+      position = end - 1;
+    } else if (char === "|") {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+export function isTableStart(lines: string[], index: number): boolean {
+  const header = lines[index] ?? "";
+  const delimiter = lines[index + 1] ?? "";
+  if (!header.includes("|") || !TABLE_DELIMITER.test(delimiter)) return false;
+  return splitTableRow(header).length === splitTableRow(delimiter).length;
+}
+
+// Agents often break a line inside a cell with `<br>`; ADF wants a hardBreak.
+function cellToAdf(text: string): AdfNode {
+  const inline: AdfNode[] = [];
+  text.split(/<br\s*\/?>/i).forEach((part, position) => {
+    if (position > 0) inline.push({ type: "hardBreak" });
+    inline.push(...inlineToAdf(part.trim()));
+  });
+  return inline.length > 0 ? { type: "paragraph", content: inline } : { type: "paragraph" };
+}
+
+function tableToAdf(rows: string[][]): AdfNode {
+  const width = rows[0]?.length ?? 0;
+  return {
+    type: "table",
+    attrs: { isNumberColumnEnabled: false, layout: "default" },
+    content: rows.map((row, rowIndex) => ({
+      type: "tableRow",
+      content: Array.from({ length: width }, (_unused, column) => ({
+        type: rowIndex === 0 ? "tableHeader" : "tableCell",
+        attrs: {},
+        content: [cellToAdf(row[column] ?? "")],
+      })),
+    })),
+  };
 }
 
 const BULLET = /^(\s*)[-*+]\s+(.*)$/;
@@ -178,6 +266,19 @@ export function markdownToAdf(markdown: string): AdfDoc {
       continue;
     }
 
+    if (isTableStart(lines, index)) {
+      const rows = [splitTableRow(line)];
+      index += 2; // header and delimiter
+      while (index < lines.length) {
+        const current = lines[index] ?? "";
+        if (current.trim() === "" || !current.includes("|")) break;
+        rows.push(splitTableRow(current));
+        index += 1;
+      }
+      content.push(tableToAdf(rows));
+      continue;
+    }
+
     const listKind = BULLET.test(line)
       ? "bulletList"
       : ORDERED.test(line)
@@ -208,7 +309,8 @@ export function markdownToAdf(markdown: string): AdfDoc {
         /^#{1,6}\s/.test(current) ||
         /^>\s?/.test(current) ||
         BULLET.test(current) ||
-        ORDERED.test(current)
+        ORDERED.test(current) ||
+        isTableStart(lines, index)
       ) {
         break;
       }
@@ -249,7 +351,7 @@ function textWithMarks(node: AdfNode): string {
   if (text.length === 0) return "";
   const marks = Array.isArray(node.marks) ? node.marks : [];
   const has = (type: string) => marks.some((mark) => mark.type === type);
-  if (has("code")) return `\`${text}\``;
+  if (has("code")) return codeSpan(text);
   if (has("strong")) text = `**${text}**`;
   if (has("em")) text = `*${text}*`;
   if (has("strike")) text = `~~${text}~~`;
@@ -341,15 +443,19 @@ function blockToMarkdown(node: AdfNode): string {
           return `- [${done ? "x" : " "}] ${inlineToMarkdown(children(item))}`;
         })
         .join("\n");
-    case "table":
-      return children(node)
-        .map(
-          (row) =>
-            `| ${children(row)
-              .map((cell) => blocksToMarkdown(children(cell)).replace(/\n+/g, " "))
-              .join(" | ")} |`,
-        )
-        .join("\n");
+    case "table": {
+      // GFM needs the delimiter row after the header, or the pipes render as text.
+      const rows = children(node).map((row) =>
+        children(row).map((cell) =>
+          blocksToMarkdown(children(cell)).replace(/\|/g, "\\|").replace(/\n+/g, "<br>"),
+        ),
+      );
+      if (rows.length === 0) return "";
+      const width = Math.max(...rows.map((row) => row.length));
+      const line = (cells: string[]) =>
+        `| ${Array.from({ length: width }, (_unused, column) => cells[column] ?? "").join(" | ")} |`;
+      return [line(rows[0] ?? []), line(Array(width).fill("---")), ...rows.slice(1).map(line)].join("\n");
+    }
     case "mediaSingle":
     case "mediaGroup":
     case "media":

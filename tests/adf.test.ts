@@ -2,6 +2,70 @@ import { describe, expect, it } from "vitest";
 import { adfToMarkdown, markdownToAdf } from "../adf";
 
 describe("markdown -> ADF", () => {
+  it("builds a table from a GFM table and reads it back", () => {
+    const markdown = "Intro\n| Field | Value |\n| :-- | --: |\n| **a** | `x \\| y` |\n| b<br>c |\n\nAfter";
+    const doc = markdownToAdf(markdown);
+    const cell = (type: string, content: unknown[]) => ({
+      type,
+      attrs: {},
+      content: [content.length > 0 ? { type: "paragraph", content } : { type: "paragraph" }],
+    });
+    expect(doc.content).toEqual([
+      { type: "paragraph", content: [{ type: "text", text: "Intro" }] },
+      {
+        type: "table",
+        attrs: { isNumberColumnEnabled: false, layout: "default" },
+        content: [
+          {
+            type: "tableRow",
+            content: [
+              cell("tableHeader", [{ type: "text", text: "Field" }]),
+              cell("tableHeader", [{ type: "text", text: "Value" }]),
+            ],
+          },
+          {
+            type: "tableRow",
+            content: [
+              cell("tableCell", [{ type: "text", text: "a", marks: [{ type: "strong" }] }]),
+              cell("tableCell", [{ type: "text", text: "x | y", marks: [{ type: "code" }] }]),
+            ],
+          },
+          {
+            type: "tableRow",
+            content: [
+              cell("tableCell", [{ type: "text", text: "b" }, { type: "hardBreak" }, { type: "text", text: "c" }]),
+              cell("tableCell", []),
+            ],
+          },
+        ],
+      },
+      { type: "paragraph", content: [{ type: "text", text: "After" }] },
+    ]);
+    expect(adfToMarkdown(doc)).toBe(
+      "Intro\n\n| Field | Value |\n| --- | --- |\n| **a** | `x \\| y` |\n| b<br>c |  |\n\nAfter",
+    );
+  });
+
+  it("keeps multi-backtick code spans in a table row intact", () => {
+    const markdown = "| # | 문제 | 파일 |\n|---|---|---|\n| 5 | ```` ``` ````만 세어 `~~~`나 | (`src/pr.ts`) |";
+    const doc = markdownToAdf(markdown);
+    const cells = doc.content[0]?.content?.[1]?.content ?? [];
+    expect(cells).toHaveLength(3);
+    expect(cells[1]?.content?.[0]?.content).toEqual([
+      { type: "text", text: "```", marks: [{ type: "code" }] },
+      { type: "text", text: "만 세어 " },
+      { type: "text", text: "~~~", marks: [{ type: "code" }] },
+      { type: "text", text: "나" },
+    ]);
+    expect(adfToMarkdown(doc)).toBe(
+      "| # | 문제 | 파일 |\n| --- | --- | --- |\n| 5 | ```` ``` ````만 세어 `~~~`나 | (`src/pr.ts`) |",
+    );
+  });
+
+  it("leaves pipes without a delimiter row as paragraph text", () => {
+    expect(markdownToAdf("a | b\nc | d").content[0]?.type).toBe("paragraph");
+  });
+
   it("never puts strong/em/strike on a code span, which Jira rejects", () => {
     const doc = markdownToAdf("**see `x` here** and *[`y`](https://x.dev)*");
     expect(doc.content[0].content).toEqual([
