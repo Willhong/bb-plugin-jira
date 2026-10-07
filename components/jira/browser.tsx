@@ -232,7 +232,7 @@ export function JiraBrowser({
     );
 
   return (
-    <div ref={rootRef} className="flex h-full min-h-0 flex-col">
+    <div ref={rootRef} className="flex h-full min-h-0 min-w-0 flex-col">
       {detailOnly ? null : (
         <Toolbar
           query={query}
@@ -384,7 +384,7 @@ function Toolbar({
 
   return (
     <div className={cn("space-y-2.5 border-b border-border pb-3", compact ? "px-3 pt-3" : "px-4 pt-4 md:px-5")}>
-      <div className={cn("flex items-center gap-2", frame)}>
+      <div className={cn("flex flex-wrap items-center gap-2", frame)}>
         {compact ? null : (
           <div className="flex min-w-0 items-center gap-2">
             <Avatar user={status.user} />
@@ -417,11 +417,11 @@ function Toolbar({
       </div>
 
       <div className={cn("space-y-2", frame)}>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {jqlMode ? (
             <span className="text-sm font-medium text-foreground">JQL</span>
           ) : (
-            <div role="tablist" aria-label="Saved views" className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+            <div role="tablist" aria-label="Saved views" className="flex min-w-0 flex-1 flex-wrap gap-1">
               {VIEWS.map((entry) => (
                 <button
                   key={entry.view}
