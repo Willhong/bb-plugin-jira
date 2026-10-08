@@ -1,6 +1,6 @@
 ---
 name: jira
-description: Read and change Jira Cloud issues with the jira_* agent tools — search with JQL, read an issue with its comments, create, edit fields, move status, add/edit/delete comments, assign, move between sprints, or delete. Use when the user mentions a Jira issue key (PROJ-123), asks what is assigned to them, or wants work reflected back into Jira.
+description: Read and change Jira Cloud issues with the jira_* agent tools — search with JQL, read an issue with its comments, create, edit fields, move status, add/edit/delete comments, assign, move between sprints, set Blocks dependencies, or delete. Use when the user mentions a Jira issue key (PROJ-123), asks what is assigned to them, or wants work reflected back into Jira.
 ---
 
 # Jira
@@ -51,6 +51,7 @@ the `getDependencies` RPC with `{key}`. Both return the same JSON as the tool.
 | `jira_delete_comment` | Permanent. Only when the user asked, e.g. to merge split comments. |
 | `jira_assign_issue` | `me`, `unassigned`, a name, or an email. |
 | `jira_move_to_sprint` | Up to 50 `keys` into a sprint: a sprint id, an exact sprint name, `active` (the one active sprint), or `backlog`. Closed sprints are refused. Ambiguous names return the open sprint list — pass the id or `boardId`. |
+| `jira_update_dependencies` | Adds `addBlockedBy` (prerequisites) and `addBlocking` (dependents) as Blocks links, removes `remove` (either direction). Returns the resulting dependency JSON. |
 | `jira_delete_issue` | Permanent. Only when the user explicitly asked to delete. |
 
 Descriptions and comments are Markdown; the plugin converts to Jira's format.
@@ -59,6 +60,18 @@ Jira's format does not allow both on one piece of text.
 
 Comment edits share the **comment** approval policy; comment deletes share
 the **delete** policy.
+
+### Dependencies
+
+`jira_update_dependencies {key, addBlockedBy, addBlocking, remove}` —
+"WEB-5 waits for API-3" is `{key: "WEB-5", addBlockedBy: ["API-3"]}`, the
+same as `{key: "API-3", addBlocking: ["WEB-5"]}`. Only Blocks links are
+touched; relates/duplicates/clones are left alone. Checked before the card:
+an existing same-way link is a no-op (no prompt); a link already pointing
+the other way, a self-link, or a `remove` with no Blocks link fails with the
+reason and sends nothing. It shares the **update** (Edit issue fields)
+policy. After writing, the plugin reads the links back; a change Jira did not
+record is an error.
 
 ## Approval
 

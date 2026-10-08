@@ -72,12 +72,39 @@ const dependencyLinksSchema = z.object({
   key: z.string().min(1),
   fields: z.object({
     issuelinks: z.array(z.object({
+      id: z.string().optional(),
       type: z.object({ name: z.string(), inward: z.string(), outward: z.string() }).loose(),
       inwardIssue: z.object({ key: z.string().min(1) }).loose().optional(),
       outwardIssue: z.object({ key: z.string().min(1) }).loose().optional(),
     }).loose().refine((link) => Boolean(link.inwardIssue) !== Boolean(link.outwardIssue), "Expected one linked end")),
   }).loose(),
 }).loose();
+const linkTypesSchema = z.object({
+  issueLinkTypes: z.array(z.object({ id: z.string(), name: z.string(), inward: z.string(), outward: z.string() }).loose()),
+}).loose();
+
+/** Jira's own "Blocks" type, matched as dependency reads match it (the name may be localized). */
+function isBlocksType(type: { name: string; inward: string; outward: string }): boolean {
+  return type.name.trim().toLowerCase() === "blocks" ||
+    (type.inward.trim().toLowerCase() === "is blocked by" && type.outward.trim().toLowerCase() === "blocks");
+}
+
+/** One Blocks link on an issue, seen from that issue. */
+export interface BlockLink {
+  id: string;
+  /** The issue on the other end. */
+  key: string;
+  /** blockedBy: the other issue blocks this one. */
+  direction: "blockedBy" | "blocking";
+}
+
+/**
+ * Which create-link field names the blocker. Jira's docs and reports disagree,
+ * so the first write checks the result and flips this when Jira read it the
+ * other way.
+ */
+let blockerField: "inwardIssue" | "outwardIssue" = "inwardIssue";
+
 const dependencyItemSchema = z.object({
   id: z.string().min(1), key: z.string().min(1),
   fields: z.object({
@@ -692,10 +719,7 @@ export class JiraClient {
     const raw = dependencyLinksSchema.parse(await this.request(
       "GET", `/rest/api/3/issue/${encodeURIComponent(key)}?fields=issuelinks`,
     ));
-    const links = raw.fields.issuelinks.filter(({ type }) =>
-      type.name.trim().toLowerCase() === "blocks" ||
-      (type.inward.trim().toLowerCase() === "is blocked by" && type.outward.trim().toLowerCase() === "blocks"),
-    );
+    const links = raw.fields.issuelinks.filter(({ type }) => isBlocksType(type));
     if (links.length > DEPENDENCY_MAX) {
       throw new Error(`Too many Jira dependencies (maximum ${DEPENDENCY_MAX}); no partial result was returned.`);
     }
@@ -717,6 +741,57 @@ export class JiraClient {
       }));
     }
     return { key: raw.key, blockedBy: blockedBy.map((key) => items.get(key)!), blocking: blocking.map((key) => items.get(key)!) };
+  }
+
+  /** The issue's Blocks links with their ids, for writes. `key` is Jira's canonical key. */
+  async getBlockLinks(key: string): Promise<{ key: string; links: BlockLink[] }> {
+    const raw = dependencyLinksSchema.parse(await this.request(
+      "GET", `/rest/api/3/issue/${encodeURIComponent(key)}?fields=issuelinks`,
+    ));
+    const links = raw.fields.issuelinks.filter(({ type }) => isBlocksType(type)).map((link) => {
+      if (link.id === undefined) throw new Error(`Jira returned a link on ${raw.key} without an id.`);
+      return link.inwardIssue
+        ? { id: link.id, key: link.inwardIssue.key, direction: "blockedBy" as const }
+        : { id: link.id, key: link.outwardIssue!.key, direction: "blocking" as const };
+    });
+    return { key: raw.key, links };
+  }
+
+  private async blocksTypeId(): Promise<string> {
+    const types = linkTypesSchema.parse(await this.request("GET", "/rest/api/3/issueLinkType")).issueLinkTypes;
+    const blocks = types.find(isBlocksType);
+    if (blocks === undefined) throw new Error("This Jira site has no Blocks issue link type, so dependencies cannot be set.");
+    return blocks.id;
+  }
+
+  /**
+   * Links `blocker` blocks `blocked`, and confirms it from `blocked`'s side. If
+   * Jira recorded it the other way round, that link is deleted and recreated
+   * with the ends swapped, so a wrong-way link never stays.
+   */
+  async addBlocksLink(blocker: string, blocked: string): Promise<void> {
+    const typeId = await this.blocksTypeId();
+    const create = (field: typeof blockerField) =>
+      this.request("POST", "/rest/api/3/issueLink", {
+        type: { id: typeId },
+        [field]: { key: blocker },
+        [field === "inwardIssue" ? "outwardIssue" : "inwardIssue"]: { key: blocked },
+      });
+    const before = new Set((await this.getBlockLinks(blocked)).links.map((link) => link.id));
+    await create(blockerField);
+    const added = (await this.getBlockLinks(blocked)).links.filter((link) => !before.has(link.id) && link.key === blocker);
+    if (added.some((link) => link.direction === "blockedBy")) return;
+    const reversed = added.find((link) => link.direction === "blocking");
+    if (reversed === undefined) throw new Error(`Jira accepted the link but ${blocked} does not show it. Check ${blocked} in Jira.`);
+    await this.deleteIssueLink(reversed.id);
+    blockerField = blockerField === "inwardIssue" ? "outwardIssue" : "inwardIssue";
+    await create(blockerField);
+    const fixed = (await this.getBlockLinks(blocked)).links.some((link) => link.key === blocker && link.direction === "blockedBy");
+    if (!fixed) throw new Error(`Jira did not record ${blocker} blocking ${blocked}. Check ${blocked} in Jira.`);
+  }
+
+  async deleteIssueLink(linkId: string): Promise<void> {
+    await this.request("DELETE", `/rest/api/3/issueLink/${encodeURIComponent(linkId)}`);
   }
 
   async createIssue(input: CreateIssueInput): Promise<{ key: string }> {

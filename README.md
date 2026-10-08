@@ -93,6 +93,25 @@ bb hongcore run jira bb.rpc --input '{"method":"getDependencies","input":{"key":
 
 The same source runs in BB and HongCore; build and reload both after edits.
 
+## Dependency writes
+
+`jira_update_dependencies {key, addBlockedBy, addBlocking, remove}` and RPC
+`updateDependencies` (the issue view; no approval). Adds use
+`POST /rest/api/3/issueLink` with the site's Blocks type id (from
+`/rest/api/3/issueLinkType`, matched like reads); removes use
+`DELETE /rest/api/3/issueLink/{id}` on every Blocks link of the pair, so other
+link types survive. Agent writes go through the `update` (Edit issue fields)
+policy.
+
+Which create-body field names the blocker is not documented consistently, so
+`addBlocksLink` reads the blocked issue back after each create. If Jira
+recorded the link the other way round, that link is deleted and recreated with
+the ends swapped, and the process remembers the swap. A wrong-way link never
+stays. Same-way duplicates are no-ops; reversed links, self-links and
+removing a non-dependency are refused before the prompt; anything Jira did not
+record after writing is an error. The issue view has a Dependencies section
+(Blocked by / Blocking, add by search or full key, remove with ×).
+
 ## Development
 
 ```sh

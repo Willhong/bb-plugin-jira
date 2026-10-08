@@ -32,6 +32,30 @@ function fakeJira() {
       project: { key: "WEB" },
     },
   };
+  // WEB-7..9: issues whose Blocks links live in `links`. `inwardIsBlocker`
+  // decides how this fake Jira reads a create-link body.
+  const BLOCKS = { id: "10000", name: "Blocks", inward: "is blocked by", outward: "blocks" };
+  const linkWorld = { inwardIsBlocker: true, nextId: 500 };
+  const links: Array<{ id: string; blocker: string; blocked: string }> = [];
+  const linkedIssue = (key: string) => ({
+    id: `id-${key}`,
+    key,
+    fields: {
+      summary: `Task ${key}`,
+      status: { name: "To Do", statusCategory: { key: "new" } },
+      issuetype: { name: "Task" },
+      assignee: null,
+      reporter: ME,
+      project: { key: "WEB" },
+      issuelinks: links.flatMap((link): unknown[] =>
+        link.blocked === key
+          ? [{ id: link.id, type: BLOCKS, inwardIssue: { key: link.blocker } }]
+          : link.blocker === key
+            ? [{ id: link.id, type: BLOCKS, outwardIssue: { key: link.blocked } }]
+            : [],
+      ),
+    },
+  });
   const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
     const parsed = new URL(url);
     const method = init.method ?? "GET";
@@ -95,13 +119,30 @@ function fakeJira() {
       case "POST /rest/agile/1.0/sprint/42/issue":
       case "POST /rest/agile/1.0/backlog/issue":
         return new Response(null, { status: 204 });
-      default:
+      case "GET /rest/api/3/issueLinkType":
+        return json({ issueLinkTypes: [{ id: "10003", name: "Relates", inward: "relates to", outward: "relates to" }, BLOCKS] });
+      case "POST /rest/api/3/issueLink": {
+        const [blocker, blocked] = linkWorld.inwardIsBlocker
+          ? [body.inwardIssue.key, body.outwardIssue.key]
+          : [body.outwardIssue.key, body.inwardIssue.key];
+        links.push({ id: String(linkWorld.nextId++), blocker, blocked });
+        return new Response(null, { status: 201 });
+      }
+      default: {
+        const linked = /^\/rest\/api\/3\/issue\/(WEB-[789])$/.exec(parsed.pathname);
+        if (method === "GET" && linked !== null) return json(linkedIssue(linked[1]!));
+        const unlink = /^\/rest\/api\/3\/issueLink\/(\d+)$/.exec(parsed.pathname);
+        if (method === "DELETE" && unlink !== null) {
+          links.splice(links.findIndex((link) => link.id === unlink[1]), 1);
+          return new Response(null, { status: 204 });
+        }
         if (method === "GET" && dependencyIssues[parsed.pathname]) return json(dependencyIssues[parsed.pathname]);
         return json({ errorMessages: [`unexpected ${route}`] }, 404);
+      }
     }
   });
   const writes = () => calls.filter((call) => call.method !== "GET" && call.path !== "/rest/api/3/search/jql");
-  return { calls, writes, fetchImpl, issue, dependencyIssues };
+  return { calls, writes, fetchImpl, issue, dependencyIssues, links, linkWorld };
 }
 
 async function waitFor<T>(read: () => T | undefined): Promise<T> {
@@ -181,6 +222,98 @@ describe("dependency reads", () => {
     await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow();
     jira.issue.fields.issuelinks = Array.from({ length: 101 }, (_, i) => ({ type, inwardIssue: { key: `API-${i + 1}` } }));
     await expect(harness.callRpc("getDependencies", { key: "WEB-1" })).rejects.toThrow(/Too many Jira dependencies/);
+  });
+});
+
+describe("dependency writes", () => {
+  const blocks = () => jira.links.map((link) => `${link.blocker}>${link.blocked}`).sort();
+
+  it("asks with both directions spelled out, writes after approval, and returns the new graph", async () => {
+    const harness = await load();
+    const pending = harness.callAgentTool("jira_update_dependencies", { key: "web-7", addBlockedBy: ["WEB-8"], addBlocking: ["web-9"] });
+    const prompt = await waitFor(() => harness.pendingInteractions[0]);
+    expect(prompt.payload).toMatchObject({
+      action: "update",
+      issueKey: "WEB-7",
+      summary: "Edit WEB-7: dependencies",
+      details: [
+        { label: "Issue", value: "WEB-7" },
+        { label: "Blocked by +", value: "WEB-8 Task WEB-8" },
+        { label: "Blocking +", value: "WEB-9 Task WEB-9" },
+      ],
+    });
+    expect(jira.writes()).toEqual([]);
+
+    harness.submitInteraction(prompt.id, "once");
+    expect(JSON.parse((await pending) as string)).toMatchObject({
+      key: "WEB-7",
+      blockedBy: [{ key: "WEB-8", statusCategory: "todo" }],
+      blocking: [{ key: "WEB-9" }],
+    });
+    expect(blocks()).toEqual(["WEB-7>WEB-9", "WEB-8>WEB-7"]);
+    for (const key of ["WEB-7", "WEB-8", "WEB-9"]) {
+      expect(harness.realtimeSignals).toContainEqual({ channel: "issue-changed", payload: { key, deleted: false } });
+    }
+  });
+
+  it("follows whichever way Jira reads a new link, and never leaves a wrong-way link", async () => {
+    const harness = await load({ ...CONFIGURED, allow_update: PERMISSION_ALWAYS });
+    for (const inwardIsBlocker of [false, true]) {
+      jira.linkWorld.inwardIsBlocker = inwardIsBlocker;
+      jira.links.length = 0;
+      await harness.callRpc("updateDependencies", { key: "WEB-7", addBlockedBy: ["WEB-8"] });
+      expect(blocks()).toEqual(["WEB-8>WEB-7"]);
+      // Learned: the next link is right the first time.
+      const posts = () => jira.writes().filter((call) => call.path === "/rest/api/3/issueLink").length;
+      const before = posts();
+      await harness.callAgentTool("jira_update_dependencies", { key: "WEB-9", addBlocking: ["WEB-7"] });
+      expect(posts() - before).toBe(1);
+      expect(blocks()).toEqual(["WEB-8>WEB-7", "WEB-9>WEB-7"]);
+    }
+  });
+
+  it("removes from the page without a prompt, in either direction", async () => {
+    jira.links.push({ id: "1", blocker: "WEB-8", blocked: "WEB-7" }, { id: "2", blocker: "WEB-7", blocked: "WEB-9" });
+    const harness = await load();
+    expect(await harness.callRpc("updateDependencies", { key: "WEB-7", remove: ["WEB-8", "WEB-9"] }))
+      .toEqual({ key: "WEB-7", blockedBy: [], blocking: [] });
+    expect(jira.writes().map((call) => `${call.method} ${call.path}`)).toEqual([
+      "DELETE /rest/api/3/issueLink/1",
+      "DELETE /rest/api/3/issueLink/2",
+    ]);
+    expect(harness.pendingInteractions).toEqual([]);
+  });
+
+  it("treats an existing dependency as done, without asking or writing", async () => {
+    jira.links.push({ id: "1", blocker: "WEB-8", blocked: "WEB-7" });
+    const harness = await load();
+    const result = await harness.callAgentTool("jira_update_dependencies", { key: "WEB-7", addBlockedBy: ["WEB-8"] });
+    expect(JSON.parse(result as string)).toMatchObject({ blockedBy: [{ key: "WEB-8" }] });
+    expect(harness.pendingInteractions).toEqual([]);
+    expect(jira.writes()).toEqual([]);
+  });
+
+  it("refuses self, reversed, missing, and doubled changes before asking", async () => {
+    jira.links.push({ id: "1", blocker: "WEB-7", blocked: "WEB-8" });
+    const harness = await load();
+    const attempt = async (changes: Record<string, string[]>) =>
+      JSON.stringify(await harness.callAgentTool("jira_update_dependencies", { key: "WEB-7", ...changes }));
+    expect(await attempt({ addBlockedBy: ["WEB-7"] })).toContain("cannot depend on itself");
+    expect(await attempt({ addBlockedBy: ["WEB-8"] })).toContain("already blocks WEB-8");
+    expect(await attempt({ addBlocking: ["WEB-9"], remove: ["WEB-9"] })).toContain("in both addBlocking and remove");
+    expect(await attempt({ remove: ["WEB-9"] })).toContain("neither blocks nor is blocked by");
+    expect(await attempt({})).toContain("Nothing to change");
+    expect(await attempt({ addBlocking: ["WEB-404"] })).toContain("404");
+    expect(harness.pendingInteractions).toEqual([]);
+    expect(jira.writes()).toEqual([]);
+  });
+
+  it("sends nothing when the user declines", async () => {
+    const harness = await load();
+    const pending = harness.callAgentTool("jira_update_dependencies", { key: "WEB-7", addBlocking: ["WEB-8"] });
+    harness.cancelInteraction((await waitFor(() => harness.pendingInteractions[0])).id);
+    expect(await pending).toMatchObject({ isError: true });
+    expect(jira.writes()).toEqual([]);
   });
 });
 

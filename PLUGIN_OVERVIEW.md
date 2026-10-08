@@ -7,14 +7,14 @@
   column per workflow status. Drag a card to another column to move the issue;
   a move the workflow does not allow snaps back with the reason.
 - An issue view where you edit the title, description, status, assignee, sprint,
-  priority, labels, and comments in place. Deleting asks for confirmation.
+  priority, labels, comments, and what it is **blocked by** and **blocking** in place. Deleting asks for confirmation.
 - The same browser as a thread side panel, and `@` mentions that attach an
   issue's current state to a message.
 
 ## Agents
 
 Agents get tools to search, read, create, edit, transition, comment on, assign,
-move between sprints, and delete issues. Descriptions and comments are written in Markdown and
+move between sprints, set Blocks dependencies on, and delete issues. Descriptions and comments are written in Markdown and
 converted to Jira's format.
 
 Every kind of change asks first by default. Create, edit, status, comment,

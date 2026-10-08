@@ -2,15 +2,17 @@
 // or description to edit, change status from the lozenge, and change
 // assignee, priority, and labels from the field column. Everything here is
 // the user's own action, so only delete asks for confirmation.
-import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   Markdown,
   UrlLink,
   experimental_ProviderModelPicker as ProviderModelPicker,
   useBbNavigate,
+  useRealtime,
   type ExperimentalProviderModelPickerValue,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
+import type { JiraDependencies, JiraDependency, JiraIssueSummary } from "../../jira";
 import type {
   AgentTargets,
   IssueSprints,
@@ -50,6 +52,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -227,6 +230,7 @@ function LoadedIssue({
         </aside>
         <div className="min-w-0 flex-1 space-y-6">
           <DescriptionEditor issue={issue} />
+          <DependenciesSection issue={issue} onOpenIssue={onOpenIssue} />
           <CommentsSection
             issueKey={issue.key}
             comments={detail.comments}
@@ -372,6 +376,276 @@ function SectionTitle({ children }: { children: ReactNode }) {
 // ---------------------------------------------------------------------------
 // Comments.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Dependencies: Blocks links, as what this issue waits for and what waits for it.
+// ---------------------------------------------------------------------------
+
+type DependencyChanges = { addBlockedBy?: string[]; addBlocking?: string[]; remove?: string[] };
+
+const FULL_KEY = /^[A-Za-z][A-Za-z0-9_]*-\d+$/;
+
+function DependenciesSection({ issue, onOpenIssue }: { issue: JiraIssue; onOpenIssue: (key: string) => void }) {
+  const rpc = useJiraRpc();
+  const [dependencies, setDependencies] = useState<JiraDependencies | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const refetch = useCallback(() => {
+    rpc.call("getDependencies", { key: issue.key }).then(
+      (next) => {
+        setDependencies(next);
+        setError(null);
+      },
+      (failure: unknown) => setError(errorText(failure)),
+    );
+  }, [rpc, issue.key]);
+  useEffect(() => {
+    refetch();
+  }, [refetch]);
+  // This issue, or one it depends on, changed (a status move shows here too).
+  useRealtime("issue-changed", (payload) => {
+    const key = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>).key : null;
+    const linked = [...(dependencies?.blockedBy ?? []), ...(dependencies?.blocking ?? [])];
+    if (key === issue.key || linked.some((entry) => entry.key === key)) refetch();
+  });
+
+  const change = (changes: DependencyChanges) => {
+    setSaving(true);
+    return rpc
+      .call("updateDependencies", { key: issue.key, ...changes })
+      .then(setDependencies)
+      .catch((failure: unknown) => {
+        toast.error(errorText(failure));
+        throw failure;
+      })
+      .finally(() => setSaving(false));
+  };
+
+  const linkedKeys = new Set([...(dependencies?.blockedBy ?? []), ...(dependencies?.blocking ?? [])].map((entry) => entry.key));
+  return (
+    <section className="space-y-2">
+      <SectionTitle>Dependencies</SectionTitle>
+      {dependencies === null ? (
+        error !== null ? (
+          <div className="space-y-2">
+            <InlineError message={error} />
+            <Button size="sm" variant="outline" onClick={refetch}>
+              Retry
+            </Button>
+          </div>
+        ) : (
+          <Skeleton className="h-16 w-full" />
+        )
+      ) : (
+        <div className="divide-y divide-border rounded-lg border border-border">
+          <DependencyGroup
+            title="Blocked by"
+            hint={`${issue.key} waits for these`}
+            empty="Nothing blocks this issue."
+            items={dependencies.blockedBy}
+            issue={issue}
+            excludeKeys={linkedKeys}
+            saving={saving}
+            onOpenIssue={onOpenIssue}
+            onAdd={(key) => change({ addBlockedBy: [key] })}
+            onRemove={(key) => change({ remove: [key] })}
+          />
+          <DependencyGroup
+            title="Blocking"
+            hint={`These wait for ${issue.key}`}
+            empty="Nothing waits for this issue."
+            items={dependencies.blocking}
+            issue={issue}
+            excludeKeys={linkedKeys}
+            saving={saving}
+            onOpenIssue={onOpenIssue}
+            onAdd={(key) => change({ addBlocking: [key] })}
+            onRemove={(key) => change({ remove: [key] })}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DependencyGroup({
+  title,
+  hint,
+  empty,
+  items,
+  issue,
+  excludeKeys,
+  saving,
+  onOpenIssue,
+  onAdd,
+  onRemove,
+}: {
+  title: string;
+  hint: string;
+  empty: string;
+  items: JiraDependency[];
+  issue: JiraIssue;
+  excludeKeys: Set<string>;
+  saving: boolean;
+  onOpenIssue: (key: string) => void;
+  onAdd: (key: string) => Promise<unknown>;
+  onRemove: (key: string) => Promise<unknown>;
+}) {
+  return (
+    <div className="space-y-1 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-foreground">{title}</span>
+        <span className="text-xs text-muted-foreground">{items.length > 0 ? items.length : ""}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={hint}>
+          {hint}
+        </span>
+        <AddDependency title={title} issue={issue} excludeKeys={excludeKeys} disabled={saving} onAdd={onAdd} />
+      </div>
+      {items.length === 0 ? (
+        <p className="py-1 text-xs text-muted-foreground">{empty}</p>
+      ) : (
+        <ul>
+          {items.map((dependency) => (
+            <li key={dependency.key} className="group flex items-center gap-2 py-1 text-sm">
+              <IssueKey issueKey={dependency.key} />
+              <button
+                type="button"
+                className="min-w-0 flex-1 truncate text-left text-foreground hover:underline"
+                title={`Open ${dependency.key}`}
+                onClick={() => onOpenIssue(dependency.key)}
+              >
+                {dependency.title}
+              </button>
+              <StatusLozenge name={dependency.status} category={dependency.statusCategory} className="shrink-0" />
+              <Button
+                size="icon"
+                variant="ghost"
+                className="size-6 shrink-0 opacity-60 group-hover:opacity-100"
+                disabled={saving}
+                aria-label={`Remove dependency on ${dependency.key}`}
+                onClick={() => void onRemove(dependency.key).catch(() => {})}
+              >
+                <Icon name="X" className="size-3.5" />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Search the issue's project by key or summary; a full key such as API-3 reaches other projects. */
+function AddDependency({
+  title,
+  issue,
+  excludeKeys,
+  disabled,
+  onAdd,
+}: {
+  title: string;
+  issue: JiraIssue;
+  excludeKeys: Set<string>;
+  disabled: boolean;
+  onAdd: (key: string) => Promise<unknown>;
+}) {
+  const rpc = useJiraRpc();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<JiraIssueSummary[] | null>(null);
+  const generation = useRef(0);
+
+  useEffect(() => {
+    if (!open) return;
+    const current = ++generation.current;
+    const timer = setTimeout(() => {
+      rpc
+        .call("search", { view: "all", projectKey: issue.projectKey, text: query.trim(), includeDone: true })
+        .then(
+          ({ issues }) => current === generation.current && setResults(issues),
+          () => current === generation.current && setResults([]),
+        );
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [rpc, open, query, issue.projectKey]);
+
+  const typed = query.trim().toUpperCase();
+  const shown = (results ?? []).filter((entry) => entry.key !== issue.key && !excludeKeys.has(entry.key)).slice(0, 8);
+  const offerTyped = FULL_KEY.test(typed) && typed !== issue.key && !shown.some((entry) => entry.key === typed);
+  const add = (key: string) => {
+    onAdd(key).then(
+      () => {
+        setOpen(false);
+        setQuery("");
+      },
+      () => {},
+    );
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button size="sm" variant="ghost" className="h-6 shrink-0 px-1.5 text-xs" disabled={disabled} aria-label={`Add ${title.toLowerCase()}`}>
+          <Icon name="Plus" className="size-3.5" />
+          Add
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72 p-0">
+        <div className="border-b border-border p-2">
+          <Input
+            autoFocus
+            aria-label="Search issues to link"
+            placeholder={`Key or summary, e.g. ${issue.projectKey}-12`}
+            value={query}
+            className="h-8 text-sm"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              const first = offerTyped ? typed : shown[0]?.key;
+              if (first !== undefined) add(first);
+            }}
+          />
+        </div>
+        <ul className="max-h-64 overflow-y-auto py-1">
+          {offerTyped ? (
+            <li>
+              <button
+                type="button"
+                disabled={disabled}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-state-hover"
+                onClick={() => add(typed)}
+              >
+                <Icon name="Plus" className="size-3.5 text-muted-foreground" />
+                Add {typed}
+              </button>
+            </li>
+          ) : null}
+          {results === null ? (
+            <li className="px-3 py-2 text-xs text-muted-foreground">Searching…</li>
+          ) : shown.length === 0 && !offerTyped ? (
+            <li className="px-3 py-2 text-xs text-muted-foreground">No matching issues</li>
+          ) : (
+            shown.map((entry) => (
+              <li key={entry.key}>
+                <button
+                  type="button"
+                  disabled={disabled}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-state-hover"
+                  onClick={() => add(entry.key)}
+                >
+                  <TypeGlyph type={entry.issueType} />
+                  <IssueKey issueKey={entry.key} />
+                  <span className="min-w-0 flex-1 truncate">{entry.summary}</span>
+                </button>
+              </li>
+            ))
+          )}
+        </ul>
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 function CommentsSection({
   issueKey,

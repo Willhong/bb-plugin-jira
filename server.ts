@@ -38,6 +38,7 @@ import {
   type JiraSprint,
   type JiraIssue,
   type JiraDependencies,
+  type JiraDependency,
   type JiraIssueSummary,
   type JiraUser,
   type StatusCategory,
@@ -51,6 +52,8 @@ const LINKS_CHANGED = "links-changed";
 /** kv: Record<bbProjectId, jiraProjectKey[]> */
 const LINKS_KEY = "project-links";
 const AGENT_SEARCH_MAX = 50;
+/** Issues one dependency edit may name per list. */
+const DEPENDENCY_CHANGE_MAX = 20;
 /**
  * The BB Sidebar plugin, whose `settle` rpc files a thread away on its settled
  * shelf as an explicit user choice. Optional: an install without it, or with it
@@ -212,6 +215,17 @@ export const jiraRpcContract = defineRpcContract({
   },
   getDependencies: {
     input: z.object({ key: z.string().min(1).max(64) }).strict(),
+    output: anyOutput<JiraDependencies>(),
+  },
+  updateDependencies: {
+    input: z
+      .object({
+        key: issueKeyInput,
+        addBlockedBy: z.array(z.string().min(1).max(64)).max(DEPENDENCY_CHANGE_MAX).default([]),
+        addBlocking: z.array(z.string().min(1).max(64)).max(DEPENDENCY_CHANGE_MAX).default([]),
+        remove: z.array(z.string().min(1).max(64)).max(DEPENDENCY_CHANGE_MAX).default([]),
+      })
+      .strict(),
     output: anyOutput<JiraDependencies>(),
   },
   listProjects: {
@@ -663,6 +677,122 @@ export default async function plugin(bb: BbPluginApi) {
   // Shared operations.
   // ------------------------------------------------------------------
 
+  interface DependencyChanges {
+    addBlockedBy: readonly string[];
+    addBlocking: readonly string[];
+    remove: readonly string[];
+  }
+
+  /**
+   * Adds and removes Blocks links on one issue. Everything is resolved and
+   * checked before the prompt (`ctx` null is the user's own action, with no
+   * prompt); afterwards the dependencies are read back so a change Jira did
+   * not record is an error, not a success.
+   */
+  async function updateDependencies(
+    rawKey: string,
+    changes: DependencyChanges,
+    ctx: { threadId: string; signal: AbortSignal } | null,
+  ): Promise<JiraDependencies> {
+    const jira = await client();
+    const current = await jira.getBlockLinks(parseKey(rawKey));
+    const key = current.key;
+    type Target = { key: string; summary: string };
+    const seen = new Map<string, string>();
+    const resolveTargets = async (refs: readonly string[], list: string): Promise<Target[]> => {
+      const targets: Target[] = [];
+      for (const ref of refs) {
+        const issue = await jira.getIssue(parseKey(ref));
+        if (issue.key === key) throw new Error(`${key} cannot depend on itself.`);
+        const earlier = seen.get(issue.key);
+        if (earlier === list) continue;
+        if (earlier !== undefined) throw new Error(`${issue.key} is in both ${earlier} and ${list}; name it once.`);
+        seen.set(issue.key, list);
+        targets.push({ key: issue.key, summary: issue.summary });
+      }
+      return targets;
+    };
+    const blockedBy = await resolveTargets(changes.addBlockedBy, "addBlockedBy");
+    const blocking = await resolveTargets(changes.addBlocking, "addBlocking");
+    const removing = await resolveTargets(changes.remove, "remove");
+    if (blockedBy.length + blocking.length + removing.length === 0) {
+      throw new Error("Nothing to change: pass addBlockedBy, addBlocking, or remove.");
+    }
+
+    const linksTo = (target: Target) => current.links.filter((link) => link.key === target.key);
+    const addable = (target: Target, wanted: "blockedBy" | "blocking") => {
+      const links = linksTo(target);
+      if (links.some((link) => link.direction === wanted)) return false;
+      if (links.length > 0) {
+        throw new Error(
+          wanted === "blockedBy"
+            ? `${key} already blocks ${target.key}; making it also wait for ${target.key} would deadlock them. Remove the existing dependency first.`
+            : `${key} is already blocked by ${target.key}; making ${target.key} also wait for ${key} would deadlock them. Remove the existing dependency first.`,
+        );
+      }
+      return true;
+    };
+    const newBlockedBy = blockedBy.filter((target) => addable(target, "blockedBy"));
+    const newBlocking = blocking.filter((target) => addable(target, "blocking"));
+    for (const target of removing) {
+      if (linksTo(target).length === 0) throw new Error(`${target.key} neither blocks nor is blocked by ${key}; nothing to remove.`);
+    }
+    if (newBlockedBy.length + newBlocking.length + removing.length === 0) return jira.getDependencies(key);
+
+    const describe = (targets: Target[]) => targets.map((target) => `${target.key} ${target.summary}`).join("\n");
+    if (ctx !== null) {
+      const refusal = await authorizeAgentWrite(
+        {
+          action: "update",
+          issueKey: key,
+          summary: `Edit ${key}: dependencies`,
+          details: [
+            { label: "Issue", value: key },
+            ...(newBlockedBy.length > 0 ? [{ label: "Blocked by +", value: describe(newBlockedBy) }] : []),
+            ...(newBlocking.length > 0 ? [{ label: "Blocking +", value: describe(newBlocking) }] : []),
+            ...(removing.length > 0
+              ? [{
+                  label: "Remove",
+                  value: removing
+                    .map((target) => `${target.key} ${target.summary} (${linksTo(target)[0]?.direction === "blockedBy" ? "blocked by" : "blocking"})`)
+                    .join("\n"),
+                }]
+              : []),
+          ],
+        },
+        ctx,
+      );
+      if (refusal !== null) throw new Error(refusal);
+    }
+
+    try {
+      for (const target of newBlockedBy) await jira.addBlocksLink(target.key, key);
+      for (const target of newBlocking) await jira.addBlocksLink(key, target.key);
+      for (const target of removing) {
+        for (const link of linksTo(target)) await jira.deleteIssueLink(link.id);
+      }
+    } finally {
+      // Both ends' dependency lists change, even when a later write failed.
+      published(key);
+      for (const target of [...newBlockedBy, ...newBlocking, ...removing]) published(target.key);
+    }
+
+    const result = await jira.getDependencies(key);
+    const keys = (items: JiraDependency[]) => new Set(items.map((item) => item.key));
+    const [nowBlockedBy, nowBlocking] = [keys(result.blockedBy), keys(result.blocking)];
+    const missed = [
+      ...newBlockedBy.filter((target) => !nowBlockedBy.has(target.key)).map((target) => `${key} blocked by ${target.key}`),
+      ...newBlocking.filter((target) => !nowBlocking.has(target.key)).map((target) => `${key} blocking ${target.key}`),
+      ...removing
+        .filter((target) => nowBlockedBy.has(target.key) || nowBlocking.has(target.key))
+        .map((target) => `removal of ${target.key}`),
+    ];
+    if (missed.length > 0) {
+      throw new Error(`Jira accepted the request but did not record: ${missed.join("; ")}. Check ${key} in Jira.`);
+    }
+    return result;
+  }
+
   async function resolveAssignee(
     jira: JiraClient,
     issueKey: string,
@@ -940,6 +1070,8 @@ export default async function plugin(bb: BbPluginApi) {
 
     getIssue: ({ key }) => loadIssueDetail(key),
     getDependencies: async ({ key }) => (await client()).getDependencies(parseKey(key)),
+    updateDependencies: ({ key, addBlockedBy, addBlocking, remove }) =>
+      updateDependencies(key, { addBlockedBy, addBlocking, remove }, null),
 
     listProjects: async () => (await client()).listProjects(),
 
@@ -1174,6 +1306,31 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ key }) {
       try {
         return JSON.stringify(await (await client()).getDependencies(parseKey(key)));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  const dependencyKeys = (meaning: string) =>
+    z.array(z.string().min(1)).max(DEPENDENCY_CHANGE_MAX).default([]).describe(`${meaning} Issue keys such as PROJ-123.`);
+
+  bb.agents.registerTool({
+    name: "jira_update_dependencies",
+    description:
+      "Add or remove Blocks links (dependencies) on a Jira issue, then return the resulting {key, blockedBy, blocking} JSON as jira_get_dependencies does. Adding one that already exists is a no-op. May pause for approval (the Edit issue fields policy).",
+    instructions:
+      "Use jira_update_dependencies only for the Blocks dependencies the user asked for; relates, duplicates, clones and parents are not dependencies. Read jira_get_dependencies first when unsure which way a dependency points.",
+    presentation: { label: { pending: "Editing Jira dependencies", completed: "Edited Jira dependencies" } },
+    parameters: z.object({
+      key: keyParam,
+      addBlockedBy: dependencyKeys("Issues key must wait for (its prerequisites)."),
+      addBlocking: dependencyKeys("Issues that must wait for key (its dependents)."),
+      remove: dependencyKeys("Issues whose Blocks link with key is removed, whichever way it points."),
+    }),
+    async execute({ key, ...changes }, ctx) {
+      try {
+        return JSON.stringify(await updateDependencies(key, changes, ctx));
       } catch (error) {
         return toolError(error);
       }
