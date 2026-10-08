@@ -26,12 +26,21 @@ function fakeJira() {
       issuelinks: [] as unknown[],
       summary: "Fix login",
       status: { name: "To Do", statusCategory: { key: "new" } },
-      issuetype: { name: "Bug" },
+      issuetype: { id: "10001", name: "Bug", subtask: false } as Record<string, unknown>,
       assignee: null,
       reporter: ME,
       project: { key: "WEB" },
-    },
+    } as Record<string, unknown>,
   };
+  const ISSUE_TYPES = [
+    { id: "10001", name: "Bug", subtask: false },
+    { id: "10002", name: "Task", subtask: false },
+    { id: "10003", name: "Story", subtask: false },
+    { id: "10005", name: "Sub-task", subtask: true },
+  ];
+  // `refuse`: Jira answers a type change with this field error. `ignore`:
+  // Jira returns 204 but keeps the old type.
+  const typeWorld: { refuse: string | null; ignore: boolean } = { refuse: null, ignore: false };
   // WEB-7..9: issues whose Blocks links live in `links`. `inwardIsBlocker`
   // decides how this fake Jira reads a create-link body.
   const BLOCKS = { id: "10000", name: "Blocks", inward: "is blocked by", outward: "blocks" };
@@ -69,6 +78,16 @@ function fakeJira() {
         return json(ME);
       case "GET /rest/api/3/issue/WEB-1":
         return json(issue);
+      case "PUT /rest/api/3/issue/WEB-1": {
+        const wanted = body?.fields?.issuetype as { id: string } | undefined;
+        if (wanted !== undefined) {
+          if (typeWorld.refuse !== null) return json({ errorMessages: [], errors: { issuetype: typeWorld.refuse } }, 400);
+          if (!typeWorld.ignore) issue.fields.issuetype = ISSUE_TYPES.find((type) => type.id === wanted.id)!;
+        }
+        return new Response(null, { status: 204 });
+      }
+      case "GET /rest/api/3/project/WEB":
+        return json({ id: "1", key: "WEB", issueTypes: ISSUE_TYPES });
       case "GET /rest/api/3/issue/WEB-1/transitions":
         return json({
           transitions: [
@@ -78,6 +97,8 @@ function fakeJira() {
         });
       case "POST /rest/api/3/issue/WEB-1/transitions":
         return new Response(null, { status: 204 });
+      case "GET /rest/api/3/issue/WEB-1/comment":
+        return json({ comments: [], total: 0 });
       case "POST /rest/api/3/issue/WEB-1/comment":
         return json({ id: "c1", author: ME, body: body?.body, created: "2026-09-17T00:00:00.000Z" }, 201);
       case "GET /rest/api/3/issue/WEB-1/comment/10001":
@@ -142,7 +163,7 @@ function fakeJira() {
     }
   });
   const writes = () => calls.filter((call) => call.method !== "GET" && call.path !== "/rest/api/3/search/jql");
-  return { calls, writes, fetchImpl, issue, dependencyIssues, links, linkWorld };
+  return { calls, writes, fetchImpl, issue, dependencyIssues, links, linkWorld, typeWorld };
 }
 
 async function waitFor<T>(read: () => T | undefined): Promise<T> {
@@ -314,6 +335,129 @@ describe("dependency writes", () => {
     harness.cancelInteraction((await waitFor(() => harness.pendingInteractions[0])).id);
     expect(await pending).toMatchObject({ isError: true });
     expect(jira.writes()).toEqual([]);
+  });
+});
+
+describe("sub-tasks and parents", () => {
+  it("puts the parent key on search rows, for the panel rpc and the agent table", async () => {
+    jira.issue.fields.issuetype = { id: "10005", name: "Sub-task", subtask: true };
+    jira.issue.fields.parent = { key: "WEB-0", fields: { summary: "Login epic" } };
+    const harness = await load();
+    const page = (await harness.callRpc("search", {
+      view: "all",
+      text: "",
+      includeDone: true,
+      jql: "",
+    })) as { issues: Array<{ key: string; subtask: boolean; parentKey: string | null }> };
+    expect(page.issues[0]).toMatchObject({ key: "WEB-1", subtask: true, parentKey: "WEB-0" });
+    const search = jira.calls.find((call) => call.path === "/rest/api/3/search/jql");
+    expect((search?.body as { fields: string[] }).fields).toContain("parent");
+    expect((search?.body as { fields: string[] }).fields).not.toContain("subtasks");
+
+    const table = String(await harness.callAgentTool("jira_search_all_issues", { jql: "project = WEB" }));
+    expect(table).toContain("KEY\tTYPE\tPARENT\tSTATUS");
+    expect(table).toContain("WEB-1\tSub-task\tWEB-0\tTo Do");
+  });
+
+  it("leaves parentKey null for an issue without a parent", async () => {
+    const harness = await load();
+    const page = (await harness.callRpc("search", { view: "all", text: "", includeDone: true, jql: "" })) as {
+      issues: Array<{ parentKey: string | null }>;
+    };
+    expect(page.issues[0]?.parentKey).toBeNull();
+  });
+
+  it("lists an issue's sub-tasks in Jira's order", async () => {
+    jira.issue.fields.subtasks = [
+      { id: "2", key: "WEB-3", fields: { summary: "Second step", status: { name: "Done", statusCategory: { key: "done" } } } },
+      { id: "1", key: "WEB-2", fields: { summary: "First step", status: { name: "To Do", statusCategory: { key: "new" } } } },
+    ];
+    const harness = await load();
+    const detail = (await harness.callRpc("getIssue", { key: "WEB-1" })) as {
+      issue: { subtasks: Array<{ key: string; summary: string; status: string; statusCategory: string }> };
+    };
+    expect(detail.issue.subtasks).toEqual([
+      { key: "WEB-3", summary: "Second step", status: "Done", statusCategory: "done" },
+      { key: "WEB-2", summary: "First step", status: "To Do", statusCategory: "todo" },
+    ]);
+    const text = String(await harness.callAgentTool("jira_get_issue", { key: "WEB-1" }));
+    expect(text).toContain("Sub-tasks (2):\n- WEB-3 [Done] Second step\n- WEB-2 [To Do] First step");
+  });
+
+  it("gives an issue without sub-tasks an empty list", async () => {
+    const harness = await load();
+    const detail = (await harness.callRpc("getIssue", { key: "WEB-1" })) as { issue: { subtasks: unknown[] } };
+    expect(detail.issue.subtasks).toEqual([]);
+  });
+});
+
+describe("issue type changes", () => {
+  const allowed = { ...CONFIGURED, allow_update: PERMISSION_ALWAYS };
+  const puts = () => jira.writes().filter((call) => call.method === "PUT");
+
+  it("asks first, changes the type by id on its own, then writes the other fields", async () => {
+    const harness = await load();
+    const result = harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "story", labels: ["split"] });
+    const prompt = await waitFor(() => harness.pendingInteractions[0]);
+    expect(prompt.payload).toMatchObject({
+      action: "update",
+      details: [{ label: "Type", value: "story" }, { label: "Labels", value: "split" }],
+    });
+    expect(jira.writes()).toEqual([]);
+
+    harness.submitInteraction(prompt.id, "once");
+    expect(await result).toBe("Updated WEB-1.");
+    expect(puts().map((call) => call.body)).toEqual([
+      { fields: { issuetype: { id: "10003" } } },
+      { fields: { labels: ["split"] } },
+    ]);
+    expect(jira.issue.fields.issuetype).toMatchObject({ name: "Story" });
+  });
+
+  it("changes the type from the panel rpc too", async () => {
+    const harness = await load();
+    await harness.callRpc("updateIssue", { key: "WEB-1", issueType: "Task" });
+    expect(puts().map((call) => call.body)).toEqual([{ fields: { issuetype: { id: "10002" } } }]);
+  });
+
+  it("writes nothing when the issue already has that type", async () => {
+    const harness = await load(allowed);
+    expect(await harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "Bug" })).toBe("Updated WEB-1.");
+    expect(puts()).toEqual([]);
+  });
+
+  it("names the project's types when the type does not exist", async () => {
+    const harness = await load(allowed);
+    const result = await harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "Epic", summary: "x" });
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain('WEB has no issue type \\"Epic\\". Available: Bug, Task, Story, Sub-task.');
+    expect(puts()).toEqual([]);
+  });
+
+  it("refuses a sub-task to standard change before writing", async () => {
+    jira.issue.fields.issuetype = { id: "10005", name: "Sub-task", subtask: true };
+    const harness = await load(allowed);
+    const result = await harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "Story" });
+    expect(JSON.stringify(result)).toContain("one is a sub-task type and the other is not");
+    expect(puts()).toEqual([]);
+  });
+
+  it("returns Jira's reason when it refuses, and leaves the other fields unwritten", async () => {
+    jira.typeWorld.refuse = "The issue type selected is invalid.";
+    const harness = await load(allowed);
+    const result = await harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "Story", summary: "New" });
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain(
+      "Jira refused to change WEB-1 to Story (Jira responded 400: issuetype: The issue type selected is invalid.)",
+    );
+    expect(puts()).toHaveLength(1);
+  });
+
+  it("fails when Jira accepts the edit but keeps the old type", async () => {
+    jira.typeWorld.ignore = true;
+    const harness = await load(allowed);
+    const result = await harness.callAgentTool("jira_update_issue", { key: "WEB-1", issueType: "Story" });
+    expect(JSON.stringify(result)).toContain("Jira accepted the edit but WEB-1 is still Bug, not Story.");
   });
 });
 

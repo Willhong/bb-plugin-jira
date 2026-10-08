@@ -289,6 +289,7 @@ export const jiraRpcContract = defineRpcContract({
         description: z.string().max(32_000).optional(),
         priority: z.string().min(1).optional(),
         labels: z.array(z.string().min(1)).optional(),
+        issueType: z.string().trim().min(1).optional(),
       })
       .strict(),
     output: z.object({ ok: z.literal(true) }),
@@ -391,6 +392,7 @@ export function formatIssueRow(issue: JiraIssueSummary): string {
   return [
     issue.key,
     issue.issueType,
+    issue.parentKey ?? "-",
     issue.status,
     issue.priority || "-",
     describeUser(issue.assignee),
@@ -415,6 +417,13 @@ export function formatIssue(
     issue.parent === null ? "" : `Parent: ${issue.parent.key} ${issue.parent.summary}`,
     `Created: ${issue.created}`,
     `Updated: ${issue.updated}`,
+    ...(issue.subtasks.length === 0
+      ? []
+      : [
+          "",
+          `Sub-tasks (${issue.subtasks.length}):`,
+          ...issue.subtasks.map((subtask) => `- ${subtask.key} [${subtask.status}] ${subtask.summary}`),
+        ]),
     "",
     "Description:",
     issue.description.length > 0 ? issue.description : "(empty)",
@@ -1233,7 +1242,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { issues, nextPageToken } = await (await client()).search(jql, { maxResults });
       return [
         scope,
-        issues.length === 0 ? "No issues matched." : "KEY\tTYPE\tSTATUS\tPRIORITY\tASSIGNEE\tSUMMARY",
+        issues.length === 0 ? "No issues matched." : "KEY\tTYPE\tPARENT\tSTATUS\tPRIORITY\tASSIGNEE\tSUMMARY",
         ...issues.map(formatIssueRow),
         nextPageToken === null ? "" : "(more results exist; narrow the JQL or raise maxResults)",
       ]
@@ -1425,7 +1434,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "jira_update_issue",
     description:
-      "Edit a Jira issue's summary, description (Markdown, replaces the whole description), priority, or labels (replaces the whole set). Use jira_transition_issue for status and jira_assign_issue for assignee. May pause for approval.",
+      "Edit a Jira issue's summary, description (Markdown, replaces the whole description), priority, labels (replaces the whole set), or issue type (e.g. Task to Story). Use jira_transition_issue for status and jira_assign_issue for assignee. May pause for approval.",
     presentation: { label: { pending: "Editing Jira issue", completed: "Edited Jira issue" } },
     parameters: z.object({
       key: keyParam,
@@ -1433,11 +1442,20 @@ export default async function plugin(bb: BbPluginApi) {
       description: z.string().optional(),
       priority: z.string().min(1).optional(),
       labels: z.array(z.string().min(1)).optional(),
+      issueType: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "New issue type name or id, e.g. Story. Jira refuses sub-task to standard (or back) and types with a different workflow; the error says why.",
+        ),
     }),
     async execute({ key: rawKey, ...fields }, ctx) {
       try {
         const key = parseKey(rawKey);
         const details = [
+          ...(fields.issueType !== undefined ? [{ label: "Type", value: fields.issueType }] : []),
           ...(fields.summary !== undefined ? [{ label: "Summary", value: fields.summary }] : []),
           ...(fields.priority !== undefined ? [{ label: "Priority", value: fields.priority }] : []),
           ...(fields.labels !== undefined

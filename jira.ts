@@ -33,6 +33,8 @@ export interface JiraIssueSummary {
   statusCategory: StatusCategory;
   issueType: string;
   subtask: boolean;
+  /** The parent's key: a sub-task's parent, or the epic above a standard issue. */
+  parentKey: string | null;
   priority: string;
   assignee: JiraUser | null;
   reporter: JiraUser | null;
@@ -45,7 +47,16 @@ export interface JiraIssue extends JiraIssueSummary {
   /** Markdown, converted from ADF. */
   description: string;
   parent: { key: string; summary: string } | null;
+  /** In Jira's order. */
+  subtasks: JiraSubtask[];
   url: string;
+}
+
+export interface JiraSubtask {
+  key: string;
+  summary: string;
+  status: string;
+  statusCategory: StatusCategory;
 }
 
 export interface JiraDependency {
@@ -188,7 +199,7 @@ const rawFieldsSchema = z
     summary: z.string().nullable().optional(),
     status: rawStatusSchema.nullable().optional(),
     issuetype: z
-      .object({ name: z.string().optional(), subtask: z.boolean().optional() })
+      .object({ id: z.string().optional(), name: z.string().optional(), subtask: z.boolean().optional() })
       .loose()
       .nullable()
       .optional(),
@@ -206,6 +217,20 @@ const rawFieldsSchema = z
         fields: z.object({ summary: z.string().optional() }).loose().optional(),
       })
       .loose()
+      .nullable()
+      .optional(),
+    subtasks: z
+      .array(
+        z
+          .object({
+            key: z.string(),
+            fields: z
+              .object({ summary: z.string().optional(), status: rawStatusSchema.nullable().optional() })
+              .loose()
+              .optional(),
+          })
+          .loose(),
+      )
       .nullable()
       .optional(),
   })
@@ -382,6 +407,7 @@ export function normalizeIssueSummary(raw: z.infer<typeof rawIssueSchema>): Jira
     statusCategory: statusCategory(fields.status?.statusCategory?.key),
     issueType: fields.issuetype?.name ?? "",
     subtask: fields.issuetype?.subtask ?? false,
+    parentKey: fields.parent?.key ?? null,
     priority: fields.priority?.name ?? "",
     assignee: normalizeUser(fields.assignee),
     reporter: normalizeUser(fields.reporter),
@@ -404,6 +430,12 @@ export function normalizeIssue(
       parent?.key === undefined
         ? null
         : { key: parent.key, summary: parent.fields?.summary ?? "" },
+    subtasks: (fields.subtasks ?? []).map((subtask) => ({
+      key: subtask.key,
+      summary: subtask.fields?.summary ?? "",
+      status: subtask.fields?.status?.name ?? "",
+      statusCategory: statusCategory(subtask.fields?.status?.statusCategory?.key),
+    })),
     url: `${siteUrl}/browse/${raw.key}`,
   };
 }
@@ -591,6 +623,11 @@ export interface IssueFieldsInput {
   labels?: string[];
 }
 
+export interface UpdateIssueInput extends IssueFieldsInput {
+  /** Issue type name or id. */
+  issueType?: string;
+}
+
 export interface CreateIssueInput extends IssueFieldsInput {
   projectKey: string;
   issueType: string;
@@ -627,7 +664,11 @@ function commentPath(key: string, commentId: string): string {
 }
 
 const ISSUE_FIELDS =
-  "summary,status,issuetype,priority,assignee,reporter,labels,created,updated,project,description,parent";
+  "summary,status,issuetype,priority,assignee,reporter,labels,created,updated,project,description,parent,subtasks";
+/** Search rows leave out the heavy fields only the issue view needs. */
+const SEARCH_FIELDS = ISSUE_FIELDS.split(",").filter(
+  (field) => field !== "description" && field !== "subtasks",
+);
 
 export class JiraClient {
   constructor(
@@ -695,7 +736,7 @@ export class JiraClient {
       await this.request("POST", "/rest/api/3/search/jql", {
         jql,
         maxResults: options.maxResults ?? SEARCH_PAGE_SIZE,
-        fields: ISSUE_FIELDS.split(",").filter((field) => field !== "description"),
+        fields: SEARCH_FIELDS,
         ...(options.nextPageToken === undefined ? {} : { nextPageToken: options.nextPageToken }),
       }),
     );
@@ -811,10 +852,55 @@ export class JiraClient {
     return { key: raw.key };
   }
 
-  async updateIssue(key: string, input: IssueFieldsInput): Promise<void> {
-    await this.request("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, {
-      fields: toJiraFields(input),
-    });
+  async updateIssue(key: string, { issueType, ...input }: UpdateIssueInput): Promise<void> {
+    // The type goes first and alone, so a refused type change writes nothing else.
+    if (issueType !== undefined) await this.changeIssueType(key, issueType);
+    const fields = toJiraFields(input);
+    if (Object.keys(fields).length === 0) return;
+    await this.request("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, { fields });
+  }
+
+  /**
+   * Changes the issue type with a plain edit and confirms Jira kept it. REST
+   * cannot move an issue between a sub-task and a standard type, or between
+   * types whose workflow or fields differ; those need Jira's Move issue.
+   */
+  private async changeIssueType(key: string, issueType: string): Promise<void> {
+    const issuePath = `/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const readType = async () => {
+      const fields = rawIssueSchema.parse(await this.request("GET", `${issuePath}?fields=issuetype,project`)).fields;
+      return { type: fields?.issuetype ?? null, projectKey: fields?.project?.key ?? key.slice(0, key.lastIndexOf("-")) };
+    };
+    const current = await readType();
+    const types = await this.listIssueTypes(current.projectKey);
+    const wanted = issueType.trim().toLowerCase();
+    const target = types.find((type) => type.id === issueType.trim() || type.name.toLowerCase() === wanted);
+    if (target === undefined) {
+      throw new Error(
+        `${current.projectKey} has no issue type "${issueType}". Available: ${types.map((type) => type.name).join(", ") || "(none)"}.`,
+      );
+    }
+    if (current.type?.id === target.id) return;
+    if ((current.type?.subtask ?? false) !== target.subtask) {
+      throw new Error(
+        `Jira cannot change ${key} from ${current.type?.name ?? "its type"} to ${target.name} with an edit: one is a sub-task type and the other is not. Use Move issue in Jira.`,
+      );
+    }
+    try {
+      await this.request("PUT", issuePath, { fields: { issuetype: { id: target.id } } });
+    } catch (error) {
+      if (!(error instanceof JiraError)) throw error;
+      throw new JiraError(
+        `Jira refused to change ${key} to ${target.name} (${error.message}). Types with a different workflow or field configuration need Move issue in Jira.`,
+        error.status,
+      );
+    }
+    const after = await readType();
+    if (after.type?.id !== target.id) {
+      throw new Error(
+        `Jira accepted the edit but ${key} is still ${after.type?.name ?? "unchanged"}, not ${target.name}. Types with a different workflow or field configuration need Move issue in Jira.`,
+      );
+    }
   }
 
   async deleteIssue(key: string, deleteSubtasks: boolean): Promise<void> {

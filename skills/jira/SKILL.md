@@ -7,14 +7,16 @@ description: Read and change Jira Cloud issues with the jira_* agent tools — s
 
 ## Read first
 
-- `jira_search_issues` — JQL in, one row per issue out (key, type, status,
-  priority, assignee, summary). Example:
+- `jira_search_issues` — JQL in, one row per issue out (key, type, parent,
+  status, priority, assignee, summary). A sub-task's parent is its parent
+  issue; a standard issue's parent is its epic. Example:
   `assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`.
   **In a BB project linked to Jira projects, results are limited to those
   projects** (the first output line names the scope); leave `project = …` out.
 - `jira_search_all_issues` — the same, across every Jira project. Use it only
   when the user asks about issues outside the linked projects.
-- `jira_get_issue` — fields, the description as Markdown, the latest comments
+- `jira_get_issue` — fields, its sub-tasks in Jira's order (key, status,
+  summary), the description as Markdown, the latest comments
   (each headed `[comment <id>]`),
   and the transitions available right now. Read it before transitioning or
   editing so you use real status names.
@@ -35,6 +37,10 @@ description: Read and change Jira Cloud issues with the jira_* agent tools — s
 HongCore callers use `bb.rpc` with
 `{"method":"getDependencies","input":{"key":"PROJ-123"}}`. BB callers use
 the `getDependencies` RPC with `{key}`. Both return the same JSON as the tool.
+The `search` RPC rows carry `issueType`, `subtask` and `parentKey` (null
+when there is none); tell a sub-task from an issue under an epic by
+`subtask`, not by `parentKey`. The `getIssue` RPC's `issue` carries `parent`
+and `subtasks: [{key, summary, status, statusCategory}]` in Jira's order.
 - `jira_list_sprints` lists a project's scrum-board sprints (id, state, board,
   name, dates); defaults to active and future. Use it before
   `jira_move_to_sprint` when the target sprint is unclear.
@@ -44,7 +50,7 @@ the `getDependencies` RPC with `{key}`. Both return the same JSON as the tool.
 | Tool | Changes |
 | --- | --- |
 | `jira_create_issue` | New issue. `projectKey` defaults to the linked Jira project when there is exactly one. `assignee` takes `me`, a name, or an email. |
-| `jira_update_issue` | Summary, description, priority, labels. `description` and `labels` **replace** the current value — read first and send the full result. |
+| `jira_update_issue` | Summary, description, priority, labels, issue type. `description` and `labels` **replace** the current value — read first and send the full result. `issueType` (e.g. `Story`) is written first and on its own, then read back; Jira's refusal (sub-task ↔ standard, a different workflow or field configuration) comes back as the error and leaves the other fields unwritten. |
 | `jira_transition_issue` | Status, by transition name or target status (`Done`, `In Progress`). |
 | `jira_add_comment` | Markdown comment. Returns the new comment id. |
 | `jira_update_comment` | Replace a comment's body (full Markdown). Fix a posted comment this way instead of adding a correction. |

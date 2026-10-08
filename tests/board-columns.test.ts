@@ -5,7 +5,7 @@ import { buildBoardColumns } from "../components/jira/board-columns";
 function issue(key: string, status: string, statusCategory: JiraIssueSummary["statusCategory"]): JiraIssueSummary {
   return {
     id: key, key, projectKey: key.split("-")[0] ?? "", summary: key, status, statusCategory,
-    issueType: "Task", subtask: false, priority: "", assignee: null, reporter: null, labels: [],
+    issueType: "Task", subtask: false, parentKey: null, priority: "", assignee: null, reporter: null, labels: [],
     created: "", updated: "",
   };
 }
