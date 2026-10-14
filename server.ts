@@ -368,8 +368,9 @@ type ThreadEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["
 /**
  * Where the thread runs. Two independent choices: which machine holds the
  * checkout, and whether to work in it or in a fresh worktree branched from its
- * default base. Neither choice picked leaves the project's own default
- * environment to bb, exactly as before.
+ * default base. No machine picked means the one the dialog shows as "Runs
+ * on" — never bb's project default, which is a fresh worktree for Git
+ * checkouts even when the worktree box is unticked.
  */
 export function threadEnvironment(
   project: AgentProject,
@@ -380,7 +381,9 @@ export function threadEnvironment(
     ? ({ type: "managed-worktree", baseBranch: { kind: "default" } } as const)
     : ({ type: "unmanaged", path: null } as const);
   if (hostId.length === 0) {
-    return worktree ? { type: "host", workspace } : { type: "project-default" };
+    const fallback = project.hosts[0];
+    if (fallback === undefined) throw new Error(`${project.name} is not checked out on any machine.`);
+    return { type: "host", hostId: fallback.hostId, workspace };
   }
   if (!project.hosts.some((host) => host.hostId === hostId)) {
     throw new Error(`${project.name} is not checked out on that machine.`);

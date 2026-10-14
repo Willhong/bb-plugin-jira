@@ -829,7 +829,11 @@ describe("send to agent", () => {
     const harness = await loadWithProjects();
     await harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-web" });
     const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [{ environment: unknown }];
-    expect(spawn.environment).toEqual({ type: "project-default" });
+    expect(spawn.environment).toEqual({
+      type: "host",
+      hostId: "host-laptop",
+      workspace: { type: "unmanaged", path: null },
+    });
   });
 
   it("starts a new worktree when asked", async () => {
@@ -838,6 +842,7 @@ describe("send to agent", () => {
     const [spawn] = harness.sdk.callsTo("threads.spawn")[0] as [{ environment: unknown }];
     expect(spawn.environment).toEqual({
       type: "host",
+      hostId: "host-laptop",
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     });
   });
@@ -928,6 +933,14 @@ describe("send to agent", () => {
       throw new Error("offline");
     });
     expect(await harness.callRpc("executionDefaults", { bbProjectId: "proj-web" })).toBeNull();
+  });
+
+  it("refuses a project checked out on no machine instead of letting bb pick a worktree", async () => {
+    const harness = await loadWithProjects();
+    await expect(harness.callRpc("sendToAgent", { key: "WEB-1", bbProjectId: "proj-misc" })).rejects.toThrow(
+      "not checked out on any machine",
+    );
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([]);
   });
 
   it("refuses a machine the project is not checked out on", async () => {
